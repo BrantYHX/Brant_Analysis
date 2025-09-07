@@ -60,46 +60,57 @@ def plot_shaded_error(axes, x_vals, data, color='k', label=None, alpha=0.2, ylim
 
 def linear_svm(X_A, X_B, X_early, X_late, kfolds=10, perc_pca=0.8):
     # dataine A and B data
-    X = np.concatenate([X_A, X_B], axis=0)
-    y = np.zeros(X.shape[0])
-    y[X_A.shape[0]:] = 1  # Assign labels (0 for A, 1 for B)
+   
+    X = np.concatenate([X_A, X_B], axis=0) # Concatenate data --- generally the predicted trials
+    y = np.zeros(X.shape[0]) 
+    y[X_A.shape[0]:] = 1  # Assign labels (0 for A, 1 for B)   # X is the data, Y is the labels
     
-    acc_list = []
-    confusion_matrices = []
-    early_misclass = []
-    late_misclass = []
-    skf = StratifiedKFold(n_splits=kfolds, shuffle=True)
+    # Containers to store results
+    acc_list = []              # Classification accuracy for each fold
+    confusion_matrices = []    # Confusion matrix for each fold
+    early_misclass = []        # Proportion of early trials misclassified as B
+    late_misclass = []         # Proportion of late trials misclassified as B
+
+     # Stratified K-Fold to keep A/B ratio balanced across folds
+    skf = StratifiedKFold(n_splits=kfolds, shuffle=True) # 相当于K fold的crossvalidate，分成10份每次9个用来train一个用来test
+    
+    # Parameter grid for regularization strength (C)
     param_grid = {'C': [0.001, 0.01, 0.1, 1, 10, 100]}
-    for train_idx, test_idx in skf.split(X, y):
-    # for _ in range(kfolds):
-        # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1)
+
+    for train_idx, test_idx in skf.split(X, y):  # for loop for k times, each time use different train_idx & test_idx
+
+        # Split into train and test sets
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
-        pca = PCA(n_components=perc_pca)
-        X_train_pca = pca.fit_transform(X_train)
+        pca = PCA(n_components=perc_pca) # n_components = perc_pca (here 0.8) means keeping enough PCs so the accumulated explained variance is more than 80%
+        X_train_pca = pca.fit_transform(X_train)  # fit using X_train, then project X_train to the new space
         X_test_pca = pca.transform(X_test)
+
+        # Train a rough Linear SVM with fixed parameters --- not the best model so not used
         svm = LinearSVC(penalty='l2', dual=False, C=0.001, class_weight='balanced', max_iter=5000)
         svm.fit(X_train_pca, y_train)
         y_pred = svm.predict(X_test_pca)
         
+        # Grid search to find the best C on the training set --- the best model
         svm = LinearSVC(dual=False, class_weight='balanced', max_iter=5000)
         grid_search = GridSearchCV(svm, param_grid, cv=6, scoring='accuracy', n_jobs=-1)
         grid_search.fit(X_train_pca, y_train)
         svm = grid_search.best_estimator_  # Best model
-        # print(f"Best C: {grid_search.best_params_['C']}")
         y_pred = svm.predict(X_test_pca)
 
-        acc_list.append(accuracy_score(y_pred, y_test))
+        acc_list.append(accuracy_score(y_pred, y_test)) # accuracy score of the model above
         
+        # Compute normalized confusion matrix (row = true class, col = predicted class)
         cm = confusion_matrix(y_test, y_pred, normalize = 'true')
         cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
         confusion_matrices.append(cm)
 
-        early_pred = svm.predict(pca.transform(X_early))
-        late_pred = svm.predict(pca.transform(X_late))
-        early_misclass.append(np.sum(early_pred) / X_early.shape[0])
+        early_pred = svm.predict(pca.transform(X_early)) # Predict how many early trials are classified as B
+        late_pred = svm.predict(pca.transform(X_late))  # Predict how many late trials are classified as B
+        early_misclass.append(np.sum(early_pred) / X_early.shape[0]) # classified as B y=1, as A y=0
         late_misclass.append(np.sum(late_pred) / X_late.shape[0])
 
+    # Compute the average confusion matrix across folds
     avg_confusion_matrix = np.mean(confusion_matrices, axis=0)
 
     return acc_list, avg_confusion_matrix, early_misclass, late_misclass
@@ -140,7 +151,7 @@ def train_svm_multiclass(X, y, kfolds=5):
 
         pca = PCA(n_components=0.9)
         X_train_pca = pca.fit_transform(X_train)
-        X_test_pca = pca.transform(X_test)
+        X_test_pca = pca.transform(X_test) 
 
         svm = SVC(kernel='linear', C=0.1) 
         svm.fit(X_train_pca, y_train)
