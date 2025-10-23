@@ -79,7 +79,7 @@ def bootstrap(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat',
         if behv == 'speed':
             axes.set_ylabel('speed - baseline (m/s)')
             axes.set_ylim([0,0.8])
-        if behv == 'lick':
+        if behv == 'lick_rate':
             axes.set_ylabel('lick rate (lick/s)')
         axes.set_xticks([11.5, 19, 37])
         axes.set_xticklabels(['-1', '0', '2.4'])
@@ -96,7 +96,7 @@ def bootstrap(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat',
         if behv == 'speed':
             axes.set_ylabel('speed - baseline (m/s)')
             axes.set_ylim([0,0.8])
-        if behv == 'lick':
+        if behv == 'lick_rate':
             axes.set_ylabel('lick rate (lick/s)')
         axes.set_xticks([11.5, 19, 37])
         axes.set_xticklabels(['-1', '0', '2.4'])
@@ -115,7 +115,7 @@ def bootstrap(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat',
         if behv == 'speed':
             axes.set_ylabel('speed - baseline (m/s)')
             axes.set_ylim([0,0.5])
-        if behv == 'lick':
+        if behv == 'lick_rate':
             axes.set_ylabel('lick rate (lick/s)')
         axes.set_xticks([22.5, 30, 48])
         axes.set_xticklabels(['-1', '0', '2.4'])
@@ -188,7 +188,7 @@ def avg_plot(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat_1'
         if behv == 'speed':
             axes.set_ylabel('speed - baseline (m/s)')
             axes.set_ylim([0,0.8])
-        if behv == 'lick':
+        if behv == 'lick_rate':
             axes.set_ylabel('lick rate (lick/s)')
         axes.set_xticks([11.5, 19, 37])
         axes.set_xticklabels(['-1', '0', '2.4'])
@@ -205,7 +205,7 @@ def avg_plot(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat_1'
         if behv == 'speed':
             axes.set_ylabel('speed - baseline (m/s)')
             axes.set_ylim([0,0.8])
-        if behv == 'lick':
+        if behv == 'lick_rate':
             axes.set_ylabel('lick rate (lick/s)')
         axes.set_xticks([11.5, 19, 37])
         axes.set_xticklabels(['-1', '0', '2.4'])
@@ -225,7 +225,7 @@ def avg_plot(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat_1'
         if behv == 'speed':
             axes.set_ylabel('speed - baseline (m/s)')
             axes.set_ylim([0,0.5])
-        if behv == 'lick':
+        if behv == 'lick_rate':
             axes.set_ylabel('lick rate (lick/s)')
         axes.set_xticks([22.5, 30, 48])
         axes.set_xticklabels(['-1', '0', '2.4'])
