@@ -66,8 +66,8 @@ def bootstrap(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat',
             for trial in data[ani]['unpred_trials']['gr_2'][late_tri]:
                 late_unexp_idx[ani].append(range(data[ani]['reward_indices'][trial]-30,data[ani]['reward_indices'][trial]+31))
     t_frames = np.array(early_unexp_idx[ani]).shape[1]
-    af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][early_unexp_idx[ani]] for ani in animals]), axis = 1),color = '#E57373', alpha=0.2,label='X Trials 1-6')
-    af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][late_unexp_idx[ani]] for ani in animals]), axis = 1),color = '#E57373', alpha=0.2,label='X Trials 7-12', style='dash')
+    af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][early_unexp_idx[ani]] for ani in animals]), axis = 1),color = '#E57373', alpha=0.2,label=f'X Trials {early_tri.start+1}-{early_tri.stop}')
+    af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][late_unexp_idx[ani]] for ani in animals]), axis = 1),color = '#E57373', alpha=0.2,label=f'X Trials {late_tri.start+1}-{late_tri.stop}', style='dash')
 
     if stim_type == 'grat_1':
         axes.set_xlabel('Time (s)', fontsize=13)
@@ -175,7 +175,7 @@ def avg_plot(data, animals, axes, all_axes, behv = 'pupil', stim_type = 'grat_1'
                 exp_idx[ani].append(range(data[ani]['reward_indices'][trial-1]-30,data[ani]['reward_indices'][trial-1]+31))        
 
     t_frames = np.array(exp_idx[ani]).shape[1]
-    af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][exp_idx[ani]] for ani in animals]), axis = 1),color = '#5C9BD5', alpha=0.2,label=f'B Block 1 (X Trials {exp_tri.start+1}-{exp_tri.stop}')
+    af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][exp_idx[ani]] for ani in animals]), axis = 1),color = '#5C9BD5', alpha=0.2,label=f'B Block 1 (X Trials {exp_tri.start+1}-{exp_tri.stop})')
     af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][early_unexp_idx[ani]] for ani in animals]), axis = 1),color = '#E57373', alpha=0.2,label=f'X Trials {early_tri.start+1}-{early_tri.stop}')
     af.plot_shaded_error(axes, range(t_frames), np.mean(np.stack([data[ani][behv][late_unexp_idx[ani]] for ani in animals]), axis = 1),color = '#E57373', alpha=0.2,label=f'X Trials {late_tri.start+1}-{late_tri.stop}', style='dash')
 
