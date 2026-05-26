@@ -1,12 +1,18 @@
 # MODULES
+import os
+from os import path
+import yaml
+from pathlib import Path
+from typing import Optional
+import importlib.util
 import numpy as np
 import pandas as pd
-import os
-import yaml
-from scipy.ndimage import gaussian_filter1d
-import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
 import scipy.io
+from scipy import signal
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import correlate
+from sklearn.linear_model import LinearRegression
+from skimage.measure import EllipseModel
 
 class DataLoader:
     def __init__(self, behavior_data_path, sheet_name, suite2ppath):
@@ -31,11 +37,15 @@ class DataLoader:
         def struct_to_dict(mat_struct):
             return {key: getattr(mat_struct, key, []) for key in dir(mat_struct) if not key.startswith('_')}
 
-        unpred_trials = struct_to_dict(mat_data['unpred_trials'])
-        for gr in range(1, n_gratings + 1):
-            key = f'gr_{gr}'
-            unpred_trials[key] = unpred_trials.get(key, []).tolist() if isinstance(unpred_trials.get(key, []), np.ndarray) else unpred_trials.get(key, [])
+        def to_list(mat_obj):
+            """Convert mat_struct or numpy array to list, handling both loading formats."""
+            if hasattr(mat_obj, '_fieldnames'):  # bare mat_struct
+                return {field: np.array(getattr(mat_obj, field)).squeeze().tolist()
+                        for field in mat_obj._fieldnames}
+            else:  # numpy array wrapping a mat_struct
+                return mat_obj.squeeze().tolist()
 
+        unpred_trials = to_list(mat_data['unpred_trials'])
         pred_trials = mat_data['pred_trials'].squeeze().tolist()
         trial_start_indices = mat_data['trial_start_indices'].squeeze().tolist()
         grating_indices = struct_to_dict(mat_data['grating_indices'])
@@ -59,13 +69,28 @@ class DataLoader:
         catchA = mat_data.get('catchA', np.array([])).squeeze().tolist()
         catchB = mat_data.get('catchB', np.array([])).squeeze().tolist()
 
-        speed = mat_data['speed'].squeeze()
-        if np.isnan(mat_data['pupil']):
+        if 'speed' not in mat_data:
+            speed = []
+        else:
+            speed = mat_data['speed'].squeeze()
+        if 'lick' not in mat_data:
+            lick = []
+        else:
+            lick = mat_data['lick'].squeeze()
+
+        if 'pupil' not in mat_data:
+            pupil = []
+        elif np.isscalar(mat_data['pupil']) and np.isnan(mat_data['pupil']):
             pupil = []
         else:
             pupil = mat_data['pupil'].squeeze()
-        
-        return n_gratings,unpred_trials, pred_trials, trial_start_indices, grating_indices, position, num_bins, position_tunnel, n_trials, unpred_led, unpred_noled, catchA, catchB, speed
+
+        if 'reward_indices' not in mat_data:
+            reward_indices = []
+        else:
+            reward_indices = mat_data['reward_indices'].squeeze()
+
+        return n_gratings,unpred_trials, pred_trials, trial_start_indices, grating_indices, reward_indices, position, num_bins, position_tunnel, n_trials, unpred_led, unpred_noled, catchA, catchB, speed, lick, pupil
 
     @staticmethod    
     def extract_digital_channel(digital_data, channel_number):
@@ -74,25 +99,14 @@ class DataLoader:
     
     @staticmethod
     def detect_edges(signal):
-        edges =np.where(np.diff(signal) == 1)[0] +1# identify where in time frame signal
+        edges = np.where(np.abs(np.diff(signal.astype(int))) == 1)[0] + 1
         return edges
-    
+
     @staticmethod
     def detect_falling_edges(signal):
         edges = np.where((np.array(signal[:-1]) == True) & (np.array(signal[1:]) == False))[0] + 1
         return edges
 
-    @staticmethod
-    def find_nearest_index(time_array, target):
-        idx = np.searchsorted(time_array, target)
-        if idx == 0:
-            return 0##
-        if idx >= len(time_array):
-            return len(time_array) - 1
-        before = time_array[idx - 1]
-        after = time_array[idx]
-        return idx - 1 if abs(before - target) < abs(after - target) else idx
-                
     def load_excel_data(self):
         return pd.read_excel(self.behavior_data_path, sheet_name=self.sheet_name)
     
@@ -101,7 +115,10 @@ class DataLoader:
     
     def load_analog_data(self, fs_analog=1000):
         analog_file = os.path.join(self.behavior_data_path, 'AnalogInput.bin')
-        analog_data = np.fromfile(analog_file, dtype=np.float64).reshape(-1, 2).transpose()
+        raw = np.fromfile(analog_file, dtype=np.float64)
+        # analog_data = np.fromfile(analog_file, dtype=np.float32).reshape(-1, 2).transpose()
+        n_ch = 3 if raw.size % 3 == 0 else 2
+        analog_data = raw.reshape(-1, n_ch).T
         analog_time = np.arange(analog_data[0, :].shape[0]) / fs_analog
         return analog_time, analog_data, fs_analog
 
@@ -121,19 +138,150 @@ class DataLoader:
         pupil_data = pd.read_csv(os.path.join(self.behavior_data_path, 'PupilCamera_CameraMetadata.csv'))
         
         return encoder_csv_data, vr_csv_data, events_csv_data, counter_csv_data, quadsync_csv_data, log_file, pupil_data
+
+    def clean_oscillating_signal(self, photodiode_signal, fs, window_size_ms=15):
+        window_samples = int(window_size_ms * fs / 1000)
+        if window_samples % 2 == 0:
+            window_samples += 1
+            
+        signal_float = photodiode_signal.astype(float)
+        cleaned_signal = signal.medfilt(signal_float, kernel_size=window_samples)
+        cleaned_signal = cleaned_signal > 0.5
+        return cleaned_signal
     
+    @staticmethod
+    def find_pupil_dlc_output(behavior_data_path: str) -> Optional[str]:
+        bp = Path(behavior_data_path)
+
+        # Prefer CSV always
+        cands = (
+            sorted(bp.glob("*PupilCamera*DLC*filtered*.csv")) +
+            sorted(bp.glob("*PupilCamera*DLC*.csv"))
+        )
+        if cands:
+            return str(cands[0])
+
+        has_tables = importlib.util.find_spec("tables") is not None
+        if not has_tables:
+            return None
+
+        cands = (
+            sorted(bp.glob("*PupilCamera*DLC*filtered*.h5")) +
+            sorted(bp.glob("*PupilCamera*DLC*.h5"))
+        )
+        return str(cands[0]) if cands else None
+
+    @staticmethod
+    def load_dlc_points(dlc_path: str):
+        """Return x,y,p arrays (frames x points). Works for DLC CSV or H5.
+        Note: H5 needs pytables; if missing, user should install or export CSV.
+        """
+        dlc_path = Path(dlc_path)
+        if dlc_path.suffix.lower() == ".h5":
+            df = pd.read_hdf(dlc_path)  # requires pytables
+            x = df.xs("x", level="coords", axis=1).to_numpy()
+            y = df.xs("y", level="coords", axis=1).to_numpy()
+            p = df.xs("likelihood", level="coords", axis=1).to_numpy()
+
+        else:
+            df = pd.read_csv(dlc_path, skiprows=3, header=None)
+            # DLC csv is [x1 y1 p1 x2 y2 p2 ...] (often with a first "frame" col)
+            arr = df.to_numpy()
+            if arr.shape[1] % 3 == 1:
+                arr = arr[:, 1:]
+            x = arr[:, 0::3]
+            y = arr[:, 1::3]
+            p = arr[:, 2::3]
+
+        conf_mask = p >= 0.97
+        x = np.where(conf_mask, x, np.nan)
+        y = np.where(conf_mask, y, np.nan)
+
+        return x, y, p
+
+    @staticmethod
+    def extract_pupil_from_dlc(x, y, p, jump_thresh=20, min_points=5,min_coverage=0.5):
+        n = x.shape[0]
+
+        good = p >= min_coverage 
+        dx = np.abs(np.diff(x, axis=0, prepend=x[[0]]))
+        dy = np.abs(np.diff(y, axis=0, prepend=y[[0]]))
+        good &= ~((dx > jump_thresh) | (dy > jump_thresh))
+        
+        area = np.full(n, np.nan)
+        diameter = np.full(n, np.nan)
+        long_axis = np.full(n, np.nan)
+        cx = np.full(n, np.nan)
+        cy = np.full(n, np.nan)
+
+        ell = EllipseModel()
+
+        for i in range(n):
+            ok = good[i] & np.isfinite(x[i]) & np.isfinite(y[i])
+            xi, yi = x[i, ok], y[i, ok]
+            if xi.size < min_points:
+                continue
+
+            mx, my = np.median(xi), np.median(yi)
+            madx = np.median(np.abs(xi - mx)) + 1e-9
+            mady = np.median(np.abs(yi - my)) + 1e-9
+            keep = (np.abs(xi - mx) < 3 * madx) & (np.abs(yi - my) < 3 * mady)  # change to 3 so that i dont drop below threshold
+            xi, yi = xi[keep], yi[keep]
+            if xi.size < min_points:
+                continue
+
+            if not ell.estimate(np.column_stack([xi, yi])):
+                continue
+
+            xc, yc, a, b, _ = ell.params
+            area[i] = np.pi * a * b
+            long_axis[i] = max(a, b)
+            diameter[i] = 2 * np.sqrt(a * b)
+            cx[i], cy[i] = xc, yc
+
+        return {
+            "pupil_area": area,
+            "pupil_diameter": diameter,
+            "pupil_long_axis": long_axis,
+            "pupil_center_x": cx,
+            "pupil_center_y": cy,
+        }
+
+    def estimate_offset(self, gpu_times, diode_times, max_offset=5.0, bin_size=0.01):
+        # Convert to binary time series
+        t_min = 0
+        t_max = max(gpu_times.max(), diode_times.max()) + max_offset
+        bins = np.arange(t_min, t_max, bin_size)
+
+        gpu_hist, _ = np.histogram(gpu_times, bins)
+        diode_hist, _ = np.histogram(diode_times, bins)
+        corr = correlate(diode_hist, gpu_hist, mode='full')
+        lags = np.arange(-len(gpu_hist)+1, len(gpu_hist)) * bin_size
+        best_offset = lags[np.argmax(corr)]
+        return best_offset
+
     def align_events(self, digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data, pupil_data,analog_data, fs_analog, fs_digital, n_planes):
         # Align synchronization events between the GPU and the photodiode signal
-        photodiode_signal = self.extract_digital_channel(digital_data, 2)
-        gpu_toggle_time = quadsync_csv_data["Time"].values
-        diode_time = self.detect_edges(photodiode_signal) / fs_digital
         min_nidaq_sample = 10_000
+        photodiode_signal_raw = self.extract_digital_channel(digital_data, 2)
+        cleaned_signals = {}
+        photodiode_signal_clean = self.clean_oscillating_signal(photodiode_signal_raw, fs_digital,window_size_ms=5)
+        gpu_toggle_time = quadsync_csv_data["Time"].values
+        diode_time = self.detect_edges(photodiode_signal_clean) / fs_digital
+        # extract scanner times
+        scanner_signal = self.extract_digital_channel(digital_data, 0)
+        scanner_time = self.detect_falling_edges(scanner_signal) / fs_digital # the end of a scanning cycle or acquisition frame.
+
+        camera_signal = self.extract_digital_channel(digital_data, 6)  # P0.6
+        camera_edges = self.detect_falling_edges(camera_signal) / fs_digital
+        camera_time = np.asarray(camera_edges)  
+
         try:
             first_diode_time = diode_time[diode_time > (min_nidaq_sample / fs_digital)][0]
         except IndexError:
-            print("WARNING: No photodiode data detected. Using predicted timestamps.")
-            slope_avg = 1.0000184161
+            print("WARNING: No photodiode detected")
             intercept_avg = 1.511616
+            slope_avg = 1.000
             predicted_photodiode_time = gpu_toggle_time * slope_avg + intercept_avg
             diode_time = predicted_photodiode_time  # replace missing photodiode data
             first_diode_time = diode_time[diode_time > (min_nidaq_sample / fs_digital)][0]
@@ -157,22 +305,7 @@ class DataLoader:
         print(f"R2={r2} ---- Slope={slope} ---- intercept={intercept}")
         gpu_2_photodiode_time = lambda gpu_time: gpu_time * slope + intercept # Define functions for time conversion
 
-        # Load Pupil metadata
-        pupil_data['Frames'] = range(0, len(pupil_data['Item1']) )
-        pupil_data['Time'] = pupil_data['Frames'] /30  # sampling freq of camera
-        if os.path.exists(os.path.join(self.behavior_data_path, 'PupilCamera_CameraVideoDLC_resnet50_pupil_analysis_newNov20shuffle1_170000_filtered.csv')):
-            dlc_data = pd.read_csv(os.path.join(self.behavior_data_path, 'PupilCamera_CameraVideoDLC_resnet50_pupil_analysis_newNov20shuffle1_170000_filtered.csv'))
-            dlc_data = dlc_data.iloc[2:, 1:]
-            pupil_data.reset_index(drop=True, inplace=True)
-            dlc_data.reset_index(drop=True, inplace=True)
-            all_pupil_data = pd.concat([pupil_data, dlc_data], axis=1)
-        else:
-            all_pupil_data = pupil_data
-
-        # extract scanner times
-        scanner_signal = self.extract_digital_channel(digital_data, 0)
-        scanner_time = self.detect_falling_edges(scanner_signal) / fs_digital # the end of a scanning cycle or acquisition frame.
-        #  combine events if thy happen on the same frame
+        # # #  combine events if thy happen on the same frame
         events_csv_data['EventKey'] = events_csv_data['Frame.Time'].astype(str) + '_' + events_csv_data['EventName']
         events_aggregated = events_csv_data.groupby(['Frame.Index', 'Frame.Time']).agg({'EventName': lambda x: ', '.join(x),'EventData': lambda x: ', '.join(x.astype(str))}).reset_index()
         # events_aggregated = events_csv_data.groupby(['Frame.Index', 'Frame.Time']).agg({'EventName': lambda x: ', '.join(x), 'EventData': lambda x: ', '.join(x)}).reset_index() # combine events
@@ -184,15 +317,23 @@ class DataLoader:
         merged_data = merged_data.merge(averaged_encoder_data, left_on='Index', right_on='FrameIndex',how='left')
         merged_data.rename(columns={'Position': 'Averaged_Position', 'RotaryEncoder': 'Averaged_Encoder'}, inplace=True)
         
-        wheel_dim = 0.157
-        merged_data['Speed_Absolute'] = (merged_data['Averaged_Encoder'].diff() * wheel_dim) / merged_data[
-            'Time'].diff()
-        merged_data['Speed_Absolute'].fillna(0, inplace=True)
+        m_per_tick = 0.012
+        dt = merged_data["Time"].diff().to_numpy()
+        dc = merged_data["Averaged_Encoder"].diff().to_numpy()
+        v_m_s = (dc * m_per_tick) / dt
+        speed_m_s = np.abs(v_m_s)
+        speed_m_s = np.nan_to_num(speed_m_s, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Optional: deadband so stopped is exactly 0
+        stop_thresh_m_s = 0.01  # 1 cm/s
+        speed_m_s[speed_m_s < stop_thresh_m_s] = 0.0
+
+        merged_data["Speed_Absolute"] = speed_m_s
         merged_data['Reward'] = merged_data['EventName'].str.contains('Reward', case=False, na=False).astype(int)
         merged_data['Lick'] = merged_data['EventName'].str.contains('Lick', case=False, na=False).astype(int)
         merged_data['Teleport'] = merged_data['EventName'].str.contains('Teleport', case=False, na=False).astype(int)
         merged_data['Stim'] = merged_data['EventName'].str.contains('WallVisibility', case=False, na=False).astype(int)
+        merged_data['Opto']= merged_data['EventName'].str.contains('OptoStim', case=False, na=False).astype(int)
         event_data_list = merged_data['EventData'][merged_data[merged_data['Stim']==1].index].tolist()
         stim_value = []
         for event in event_data_list:
@@ -200,136 +341,117 @@ class DataLoader:
             stim_value.append(value)
         merged_data.loc[merged_data[merged_data['Stim']==1].index, 'Stim'] = stim_value
         merged_data = merged_data.drop(columns=['EventName', 'EventData', 'Frame.Index'])
-
-        piezo_signal = analog_data[1, :]
+        stim_times = merged_data.loc[merged_data['Stim'] > 0, 'Time'].values
+        merged_data['Time'] = gpu_2_photodiode_time(merged_data['Time'].values)  
+        
+        # piezo_signal = analog_data[0, :]
+        piezo_signal = analog_data[1 if analog_data.shape[0] > 2 else 0, :]
         piezo_time = np.arange(piezo_signal.shape[0]) / fs_analog
         indices = np.searchsorted(piezo_time, merged_data['Time'])
         indices = np.clip(indices, 0, len(piezo_signal) - 1)  #ensure within valid range for indices
         merged_data['Piezo_Signal'] = piezo_signal[indices]
-        merged_data['Time'] = gpu_2_photodiode_time(merged_data['Time'].values)    
-        # plt.figure()
-        # plt.plot(diode_time)
-        # # plt.show()
-        
-        # plt.title('photodiode_time')
-        # # sync events should be aligned for gpu and photodiode
-        # plt.figure()
-        # plt.plot(np.diff(gpu_v_photodiode[:,1]), label="Photodiode", lw=3)
-        # plt.plot(np.diff(gpu_v_photodiode[:,0]), label="GPU")
-
-        # plt.title("$\Delta$Time between adjacent sync events")
-        # plt.xlabel("Synch Event")
-        # plt.ylabel("Time(s)")
-        # plt.legend()
-        # plt.show()
-
-        # plt.figure()
-        # plt.hist(gpu_v_photodiode[:,1]-gpu_v_photodiode[:,0])
-        # # Calculate the regression that takes you Time(GPU) -> Time(NIDAQ)
-        # plt.figure()
-        # plt.scatter(gpu_v_photodiode[:,0], gpu_v_photodiode[:,1])
-        # plt.title("GPU vs Photodiode time")
-        # plt.xlabel("Time(s)")
-        # plt.ylabel("Time(s)")
-        # # plt.show()
-
-        # predicted_photodiode_times = reg.predict(gpu_v_photodiode[:, 0].reshape(-1, 1))
-        # residuals = gpu_v_photodiode[:, 1] - predicted_photodiode_times
-        # plt.figure()
-        # plt.scatter(gpu_v_photodiode[:, 0], residuals)
-        # plt.axhline(0, color='r', linestyle='--')
-        # plt.title("Residuals of GPU to Photodiode Time Regression")
-        # plt.xlabel("GPU Time(s)")
-        # plt.xlim([0,3000])
-        # plt.ylabel("Residuals (s)")
-        # plt.show()
-
-        # plt.figure(figsize=(10, 6))
-        # time_differences = gpu_v_photodiode[:,1] - gpu_v_photodiode[:,0]
-        # mean_diff = np.mean(time_differences)
-        # std_diff = np.std(time_differences)
-
-        # # Use more bins for better resolution and add styling
-        # n, bins, patches = plt.hist(time_differences, bins=30, color='skyblue', edgecolor='black', alpha=0.7)
-
-        # # Add vertical line at mean
-        # plt.axvline(mean_diff, color='red', linestyle='dashed', linewidth=2, label=f'Mean: {mean_diff:.6f}s')
-
-        # # Add title and labels
-        # plt.title('Distribution of Time Differences (Photodiode - GPU)', fontsize=14)
-        # plt.xlabel('Time Difference (seconds)', fontsize=12)
-        # plt.ylabel('Frequency', fontsize=12)
-
-        # # Add statistics annotation
-        # plt.annotate(f'Mean: {mean_diff:.6f}s\nStd Dev: {std_diff:.6f}s', 
-        #             xy=(0.7, 0.85), xycoords='axes fraction',
-        #             bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.8))
-
-        # plt.grid(alpha=0.3)
-        # plt.tight_layout()
-        # plt.show()
-
-
-
-        # plt.figure(figsize=(12, 5))
-        # plt.plot(gpu_v_photodiode[:,0], time_differences, 'o-', markersize=3)
-        # plt.axhline(mean_diff, color='red', linestyle='--', label=f'Mean difference: {mean_diff:.6f}s')
-        # plt.fill_between(gpu_v_photodiode[:,0], mean_diff-std_diff, mean_diff+std_diff, color='red', alpha=0.2, label=f'±1 std dev: {std_diff:.6f}s')
-        # plt.title('Time Difference (Photodiode - GPU) Over Recording Duration', fontsize=14)
-        # plt.xlabel('GPU Time (s)', fontsize=12)
-        # plt.ylabel('Time Difference (s)', fontsize=12)
-        # plt.legend()
-        # plt.grid(alpha=0.3)
-        # plt.tight_layout()
-        # plt.show()
-        # plt.figure(figsize=(12, 5))
-        # plt.subplot(1, 2, 1)
-        # plt.hist(time_differences, bins=30, color='skyblue', edgecolor='black', alpha=0.7)
-        # plt.title('Raw Time Differences\n(Photodiode - GPU)', fontsize=12)
-        # plt.xlabel('Time Difference (s)', fontsize=10)
-        # plt.ylabel('Frequency', fontsize=10)
-        # plt.grid(alpha=0.3)
-
-        # # Residuals after regression
-        # plt.subplot(1, 2, 2)
-        # plt.hist(residuals, bins=30, color='lightgreen', edgecolor='black', alpha=0.7)
-        # plt.title(f'Residuals After Linear Regression\nR² = {r2:.4f}', fontsize=12)
-        # plt.xlabel('Residual (s)', fontsize=10)
-        # plt.ylabel('Frequency', fontsize=10)
-        # plt.grid(alpha=0.3)
-
-        # plt.tight_layout()
-        # plt.show()
-        downsampled_data = self.check_data(merged_data,scanner_time,n_planes)
-
-        return downsampled_data, all_pupil_data
-    
-    def check_data(self, data,scanner_times,n_planes):
+        trial_start_indices_full = merged_data[merged_data['Teleport'] == 1].index.tolist()
+        reward_indices_full = merged_data[merged_data['Reward'] == 1].index.tolist()
+        # Pupil metadata
+        pupil_data = pupil_data.copy()
+        pupil_data["Frames"] = np.arange(len(pupil_data))
+        pupil_data["Time"] = pupil_data["Frames"] / 30.0  # camera FPS assumption
         data_path = os.path.join(self.behavior_data_path, 'data.pkl')
-        pupil_csv = os.path.join(self.behavior_data_path, 'PupilCamera_CameraVideoDLC_resnet50_pupil_analysis_newNov20shuffle1_170000_filtered.csv')
-
         if not os.path.exists(data_path):
             print("data not found. Processing data...")
-            downsampled_data=self.decimate_dataframe(data,scanner_times,n_planes) 
-            downsampled_data.to_pickle(os.path.join(self.behavior_data_path, 'data.pkl')) #save data
-        elif os.path.exists(data_path) and not os.path.exists(pupil_csv):
-            print("data found, no dlc pupil_data yet. Loading existing data...")
-            # downsampled_data = pd.read_pickle(data_path)
-            downsampled_data=self.decimate_dataframe(data,scanner_times,n_planes) 
-            downsampled_data.to_pickle(os.path.join(self.behavior_data_path, 'data.pkl')) #save data
+            downsampled=self.decimate_dataframe(merged_data,scanner_time,n_planes) 
+        else:
+            downsampled = pd.read_pickle(data_path)
 
-        elif os.path.exists(data_path) and os.path.exists(pupil_csv) and not os.path.exists(os.path.join(self.behavior_data_path, 'pupil_data.pkl')):
-            print("new pupil data found. Reprocess data...")
-            downsampled_data=self.decimate_dataframe(data,scanner_times,n_planes) 
-            downsampled_data.to_pickle(os.path.join(self.behavior_data_path, 'data.pkl')) #save data
-        elif os.path.exists(data_path) and os.path.exists(os.path.join(self.behavior_data_path, 'pupil_data.pkl')):
-            print("all data found. Loading existing data...")
-            downsampled_data=self.decimate_dataframe(data,scanner_times,n_planes) 
-            downsampled_data.to_pickle(os.path.join(self.behavior_data_path, 'data.pkl')) #save data
-            downsampled_data = pd.read_pickle(data_path)
-        return downsampled_data
+        pupil_cols = {"pupil_area", "pupil_diameter"} 
+        has_pupil = pupil_cols.intersection(downsampled.columns)
+        has_pupil = None
+        if has_pupil:
+            print("Pupil metrics already present -> skipping DLC processing.")
+        else:
+            dlc_path = self.find_pupil_dlc_output(self.behavior_data_path)
+            if dlc_path is None:
+                print("No DLC pupil output found -> proceeding without pupil metrics.")
+            else:
+                print("Using DLC file:", Path(dlc_path).name)
+                try:
+                    x, y, p = self.load_dlc_points(dlc_path)
+                    T = x.shape[0]
+                    bin_starts = scanner_time[::n_planes]          # EXACT same as decimate_dataframe
+                    t0, t1 = bin_starts[0], bin_starts[-1]
+                    cam = np.asarray(camera_time)
+                    j0 = np.searchsorted(cam, t0)
+
+                    # drop same frames from DLC as from camera pulses
+                    if T > j0:
+                        x, y, p = x[j0:], y[j0:], p[j0:]
+                    else:
+                        raise ValueError("DLC has fewer frames than camera pulses before scanner start.")
+
+                    T_eff = min(x.shape[0], len(cam) - j0)
+                    x, y, p = x[:T_eff], y[:T_eff], p[:T_eff]
+                    cam_frame_time = cam[j0:j0 + T_eff]
+
+                    x_d, y_d, p_d = self.bin_and_average_dlc(
+                        x, y, p, cam_frame_time, bin_starts
+                    )
+
+                    pupil_metrics = self.extract_pupil_from_dlc(
+                        x_d, y_d, p_d,
+                        jump_thresh=20,
+                        min_points=5, min_coverage = 0.5,
+                    )
+
+                    for k, v in pupil_metrics.items():
+                        downsampled[k] = v
+
+                    # confirm camera frames per bin is ~4 (30 Hz cam / 7.5 Hz bins)
+                    bin_idx = np.searchsorted(bin_starts, cam_frame_time, side="right") - 1
+                    counts = np.bincount(
+                        bin_idx[(bin_idx >= 0) & (bin_idx < len(bin_starts))],
+                        minlength=len(bin_starts)
+                    )
+
+                except Exception as e:
+                    print("WARNING: Failed to compute pupil metrics:", repr(e))
+
+        # --------------------------------------------------
+        downsampled.to_pickle(os.path.join(self.behavior_data_path, "data.pkl"))
+
+        return downsampled, pupil_data, merged_data['Piezo_Signal'], merged_data['Time'], trial_start_indices_full, reward_indices_full
     
-    def decimate_dataframe(self, df, scanner_times, nz, time_col_name='Time', binary_cols=['Lick','Reward','Teleport'], event_cols=['Stim']):
+    def bin_and_average_dlc(self, x, y, p, cam_frame_time, bin_starts):
+        T, n_pts = x.shape
+        N = len(bin_starts)
+
+        bin_idx = np.searchsorted(bin_starts, cam_frame_time, side="right") - 1
+        counts = np.bincount(bin_idx[(bin_idx>=0)&(bin_idx<len(bin_starts))], minlength=len(bin_starts))
+
+        valid = (bin_idx >= 0) & (bin_idx < N)
+        if not np.any(valid):
+            return (np.full((N, n_pts), np.nan),
+                    np.full((N, n_pts), np.nan),
+                    np.full((N, n_pts), np.nan))
+
+        bin_idx = bin_idx[valid]
+        x = x[valid]
+        y = y[valid]
+        p = p[valid]
+
+        x_d = np.full((N, n_pts), np.nan)
+        y_d = np.full((N, n_pts), np.nan)
+        p_d = np.full((N, n_pts), np.nan)
+
+        # Loop only bins that actually receive frames (faster than range(N))
+        for i in np.unique(bin_idx):
+            m = bin_idx == i
+            x_d[i] = np.nanmean(x[m], axis=0)
+            y_d[i] = np.nanmean(y[m], axis=0)
+            # p_d[i] = np.nanmean(p[m], axis=0)
+            p_d[i] = np.mean(p[m] >= 0.97, axis=0)  # fraction of frames that passed threshold
+        return x_d, y_d, p_d
+
+    def decimate_dataframe(self, df, scanner_times, nz, time_col_name='Time', binary_cols=['Lick','Reward','Teleport','Opto'], event_cols=['Stim','Teleport','Opto']):
         start_idx = np.searchsorted(df[time_col_name].values, scanner_times) # align df timestamp to nearest falling edge of scanner frame
         start_idx = start_idx[::nz]  # take every nz-th start index
         stop_idx = np.append(start_idx[1:] - 1, len(df) - 1)
@@ -372,22 +494,37 @@ class DataLoader:
                 downsampled_data = downsampled_data.iloc[:-excess_frames]
             else:
                 raise ValueError("Mismatch between detected frames in scanner signal and ROI data frames.")
-        return downsampled_data
+        return downsampled_data.reset_index(drop=True)
     
     def align_data(self, downsampled_data, dff_Zscore):
-
         aligned_data = self.align_frames(downsampled_data, dff_Zscore)
         gratings_start = aligned_data[~aligned_data['Stim'].isin([0, np.nan])].index #np.unique(aligned_data['Stim'].dropna()) 
+        gratings_start = gratings_start[np.r_[True, np.diff(gratings_start) > 2]]
         trial_start_indices = aligned_data[aligned_data['Teleport'] == 1].index.tolist()
-        stim_type = aligned_data[~aligned_data['Stim'].isin([0, np.nan])]
-        reward_delivery = aligned_data[aligned_data['Reward'] == 1].index.tolist()
+        # stim_type = stim_type = aligned_data.loc[gratings_start, 'Stim'].reset_index(drop=False)
+        opto_stim = aligned_data[aligned_data['Opto'] == 1].index.tolist()
+        # reward_delivery = aligned_data[aligned_data['Reward'] == 1].index.tolist()
         condition = (gratings_start > trial_start_indices[0]) & (gratings_start < trial_start_indices[-1]) # all gratings after the first trial ends (because scanner starts during), and all before the end of the last trial
         gratings_start = gratings_start[condition]
-        stim_type = stim_type[condition]
+        
+        reward_bins = np.asarray(aligned_data.index[aligned_data['Reward'] == 1])
+        trial_starts = np.asarray(trial_start_indices)
+        trial_ends = np.r_[trial_starts[1:], len(aligned_data)]
+
+        reward_delivery = []
+        for a, b in zip(trial_starts, trial_ends):
+            r = reward_bins[(reward_bins >= a) & (reward_bins < b)]
+            reward_delivery.append(int(r[0]) if len(r) else None)
+
+        # keep only trials with a detected reward (should be all, if your assumption holds)
+        reward_delivery = [r for r in reward_delivery if r is not None]
         log_file = os.path.join(self.behavior_data_path,'TrialLogging.yaml')
-        trial_types = np.array(self.extract_trial_type(log_file,'trialTypeLabel')[1:-1])
-        n_gratings = round(len(gratings_start)/len(trial_start_indices))
-        # group grating onsets
+        trial_types = np.array(self.extract_trial_type(log_file,'trialTypeLabel')[1:])
+        
+        n_trials = max(len(trial_start_indices) - 1, 1)
+        n_gratings = round(len(gratings_start) / n_trials)
+        # n_gratings = round(len(gratings_start)/len(trial_start_indices))
+        # group grating onsets        
         grating_onsets_dict = {f'gr_{i+1}': [] for i in range(n_gratings)}
         for i, idx in enumerate(gratings_start):
             grating_num = (i % n_gratings) + 1
@@ -395,142 +532,176 @@ class DataLoader:
         
         pre_frames = 20
         post_frames = 40
-        total_frames = pre_frames + post_frames  # 60 fr total
-        total_duration = 7.9  # seconds
-        frame_duration = total_duration / total_frames  # seconds per frame
+        total_frames = pre_frames + post_frames
 
-        grating_indices = {}
         time_values = aligned_data['Time'].values
-        # generalizable across any set of recorded planes
+        dt = dt = 7.9 / total_frames  
+        grating_indices = {}
+
         for grating, onset_indices  in grating_onsets_dict.items():
             expanded = []
-            for onset_idx  in onset_indices:
-                onset_time  = aligned_data['Time'].iloc[onset_idx]
-                target_times = np.array([onset_time + ((i - pre_frames) * frame_duration) for i in range(total_frames)]) # create target time centered around 0 by finding the nearest original timestamps to these target times 
-                closest_indices = []
-                for i, t in enumerate(target_times):
-                    if i < pre_frames:  # for pre-stim
-                        valid_indices = np.where(time_values < onset_time)[0]
-                        idx = valid_indices[np.argmin(np.abs(time_values[valid_indices] - t))]
-                    else:  # for post-stim
-                        valid_indices = np.where(time_values >= onset_time)[0]
-                        idx = valid_indices[np.argmin(np.abs(time_values[valid_indices] - t))]
-
-                    closest_indices.append(idx)
-                
-                closest_indices = np.clip(np.array(closest_indices), 0, len(time_values) - 1) # don't exceed boundaries of data acq
-                expanded.append(closest_indices)
+            for onset_idx in onset_indices:
+                onset_time = aligned_data['Time'].iloc[onset_idx]
+                target_times = onset_time + (np.arange(total_frames) - pre_frames) * dt
+                idxs = np.searchsorted(time_values, target_times)
+                idxs = np.clip(idxs, 0, len(time_values) - 1)
+                expanded.append(idxs)
 
             grating_indices[grating] = expanded
             
-        # same but with reward 
         post_frames = pre_frames
-        total_frames = pre_frames + post_frames  # 60 frames total
-        total_duration = 4.8  # seconds
-        frame_duration = total_duration / total_frames  # seconds per frame
+        total_frames = pre_frames + post_frames
+
+        time_values = aligned_data["Time"].values
+        dt = np.nanmedian(np.diff(time_values))  # works for 30 Hz or 15 Hz sessions
+
         reward_indices = []
-        for idx in reward_delivery:
-            reward_time = aligned_data['Time'].iloc[idx]
-            target_times = np.array([reward_time + ((i - pre_frames) * frame_duration) for i in range(total_frames)])
-            closest_indices = []
-            for i, t in enumerate(target_times):
-                if i < pre_frames: 
-                    valid_indices = np.where(time_values < reward_time)[0]
-                    idx = valid_indices[np.argmin(np.abs(time_values[valid_indices] - t))]
-                else: 
-                    valid_indices = np.where(time_values >= reward_time)[0]
-                    idx = valid_indices[np.argmin(np.abs(time_values[valid_indices] - t))]        
-
-                closest_indices.append(idx)
-
-            closest_indices = np.clip(np.array(closest_indices), 0, len(time_values) - 1)
-            reward_indices.append(closest_indices)
+        for ridx in reward_delivery:
+            reward_time = aligned_data["Time"].iloc[ridx]
+            target_times = reward_time + (np.arange(total_frames) - pre_frames) * dt
+            idxs = np.searchsorted(time_values, target_times)
+            idxs = np.clip(idxs, 0, len(time_values) - 1)
+            reward_indices.append(idxs)
         
         # define trial types
-        n_trials = int(len(gratings_start)/n_gratings) # list(range(len(grating_onsets_dict['gr_4'])))
+
         n_trial_types = trial_types.max()+1
         tt_mat = np.zeros((n_trials, n_trial_types), dtype=int)
         tt_mat[np.arange(n_trials), trial_types[:n_trials]] = 1
-        
+
+        unpred_trials = {f'gr_{i+1}': [] for i in range(n_gratings)}
         # unpred_trials['gr_2'] = np.sort(np.concatenate((np.where(tt_mat[:,3])[0],np.where(tt_mat[:,2])[0])))        
         # unpred_trials['gr_4'] = np.sort(np.concatenate((np.where(tt_mat[:,5])[0],np.where(tt_mat[:,2])[0])))
         all_stimuli = set(np.unique(aligned_data['Stim'].dropna()))
         expected_stim_set = {2, 4}  # always expected
         unpred_stim_set = all_stimuli - expected_stim_set
-        unpred_trials = {f'gr_{i+1}': [] for i in range(n_gratings)}
+        # unpred_trials = {f'gr_{i+1}': [] for i in range(n_gratings)}
         pred_trials = []
 
         for gr, indices in grating_onsets_dict.items():
             for i, idx in enumerate(indices):
-                if stim_type['Stim'][idx] in unpred_stim_set:
+                if aligned_data.loc[idx, 'Stim'] in unpred_stim_set:
                     unpred_trials[gr].append(i)  # Use dynamic gr key
                 else:
                     pred_trials.append(i)
-        
+        ##
         return n_gratings,aligned_data, grating_indices, reward_indices, n_trials, tt_mat, trial_start_indices, pred_trials, unpred_trials
     
 class Suite2pLoader:
-    def process_suite2p_data(self, suite2ppath,neuropil_factor):
+    def process_suite2p_data(self, suite2ppath, neuropil_factor,roitype):
         ops = np.load(os.path.join(suite2ppath, f'plane0','ops.npy'), allow_pickle=True).item()
         dF_F = []
         dF_F_red = []
         all_cells_indices = []
         n_planes = ops['nplanes']
-
+        
+        all_TC = []
         for plane_num in range(n_planes):
             plane_path = os.path.join(suite2ppath, f'plane{plane_num}')
-            F = np.load(os.path.join(plane_path, 'F.npy'))
-            Fneu = np.load(os.path.join(plane_path, 'Fneu.npy'))
-            iscell = np.load(os.path.join(plane_path, 'iscell.npy'))
+            iscell = np.load(os.path.join(plane_path,'iscell.npy'))
             cells_indices = np.where(iscell[:, 0])[0]
-            TC = (F[cells_indices,:]) - (neuropil_factor * (Fneu[cells_indices,:]))
-            # TC = (F) - (neuropil_factor * (Fneu))
-            # TC=F
-            TC_smoothed = gaussian_filter1d(TC, sigma=0.7, axis=1)
-            baseline = np.percentile(TC_smoothed,50,axis=1)
-            dF = TC_smoothed - baseline[:, None]
-            TC_dff = dF.T / baseline
-            TC_dff_Zscore = (TC_dff - np.nanmedian(TC_dff, axis=0)) / np.nanstd(TC_dff, axis=0)
-            dF_F.append(TC_dff_Zscore.T)
-            all_cells_indices.append(cells_indices)
 
+            if roitype == 'manual_suite2p':
+                F = np.load(os.path.join(plane_path, 'F_red.npy'))
+                Fneu = np.load(os.path.join(plane_path, 'Fneu_red.npy'))
+                red_path = plane_path.replace(r'\suite2p', r'\\red\suite2p')
+                iscell = np.load(os.path.join(red_path, 'iscell.npy'))
+                cells_indices = np.where(iscell[:, 0])[0]
+                F = F[cells_indices,:]
+                Fneu = Fneu[cells_indices, :]
+                TC_plane = (F) - (neuropil_factor * (Fneu))
+            
+            elif roitype == 'manual_imagej':
+                f_red_path = os.path.join(plane_path, 'F_red.npy')
+                if not os.path.exists(f_red_path):
+                    print(f"No F_red.npy in plane{plane_num}, skipping.")
+                    continue
+                F = np.load(f_red_path)
+                Fneu = np.load(os.path.join(plane_path, 'Fneu_red.npy'))
+                TC_plane = (F) - (neuropil_factor * (Fneu))
+            
+            elif roitype == 'suite2p':
+                F = np.load(os.path.join(plane_path, 'F.npy')) 
+                Fneu = np.load(os.path.join(plane_path, 'Fneu.npy')) 
+                F = F[cells_indices,:]
+                Fneu = Fneu[cells_indices, :]
+                # # if table == 2:
+                # min_val = np.min([F.min(), Fneu.min()])  # fixed
+                # if min_val < 0:
+                #     offset = abs(min_val) 
+                #     F += offset +20
+                #     Fneu += offset+20
+                
+                
+                TC_plane = (F) - (neuropil_factor * (Fneu))
+            elif roitype == 'aligned':
+                F = np.load(os.path.join(plane_path, 'F_aligned.npy')) 
+                # min_val = np.min([F.min()])  # fixed
+                # if min_val < 0:
+                #     offset = abs(min_val) 
+                #     F += offset +10
+                TC_plane = F
+                
+            all_TC.append(TC_plane.T) 
+            all_cells_indices.append(cells_indices)
             try:
                 F_red = np.load(os.path.join(plane_path, 'F_chan2.npy'))
                 TC_red = F_red[cells_indices,:]
                 TC_red_smoothed = gaussian_filter1d(TC_red, sigma=1, axis=1)
-                baseline_red = np.percentile(TC_red_smoothed,50,axis=1)
+                baseline_red = np.percentile(TC_red_smoothed, 50, axis=1)
                 dF_red = TC_red_smoothed - baseline_red[:, None]
                 TC_red_dff = dF_red.T / baseline_red
                 absolute_fluorescence_red = TC_red_smoothed
                 dF_F_red.append(absolute_fluorescence_red)
             except FileNotFoundError:
                 pass
-
-        max_columns = max(array.shape[1] for array in dF_F) # max num of columns
-        for i in range(len(dF_F)): #pad arrays with fewer columns than the maximum with NaN values
-            if dF_F[i].shape[1] < max_columns:
-                padding_size = max_columns - dF_F[i].shape[1]
-                dF_F[i] = np.hstack([dF_F[i], np.full((dF_F[i].shape[0], padding_size), np.nan)])
-
-        dF_F = np.vstack(dF_F)
+        
+        max_timepoints = max(tc.shape[0] for tc in all_TC)
+        
+        for i in range(len(all_TC)):
+            if all_TC[i].shape[0] < max_timepoints:
+                padding_size = max_timepoints - all_TC[i].shape[0]
+                all_TC[i] = np.vstack([all_TC[i], np.zeros((padding_size, all_TC[i].shape[1]))])
+        
+        TC_combined = np.hstack(all_TC)  
+        TC_smoothed = gaussian_filter1d(TC_combined, sigma=0.7, axis=0) 
+        baseline = np.percentile(TC_smoothed, 50, axis=0)  
+        TC_dff = (TC_smoothed - baseline) / baseline
+        
+        dF_F_Zscore = (TC_dff - np.nanmean(TC_dff, axis=0)) / np.nanstd(TC_dff, axis=0)
+        dF_F = dF_F_Zscore.T
+        
         if dF_F_red:
-            for i in range(len(dF_F_red)): #pad arrays with fewer columns than the maximum with NaN values
+            max_columns = dF_F.shape[1]  
+            for i in range(len(dF_F_red)):
                 if dF_F_red[i].shape[1] < max_columns:
                     padding_size = max_columns - dF_F_red[i].shape[1]
                     dF_F_red[i] = np.hstack([dF_F_red[i], np.full((dF_F_red[i].shape[0], padding_size), np.nan)])
             dF_F_red = np.vstack(dF_F_red)
-        return ops, dF_F, all_cells_indices, n_planes, iscell, TC, dF_F_red
+        # reconstruct the flat mapping from dF_F index -> (plane, suite2p ROI id)
+        flat_map = []  # list of (plane, suite2p_roi_id)
+        for plane_num, cell_ids in enumerate(all_cells_indices):  # all_cells_indices for animal 17
+            for roi_id in cell_ids:
+                flat_map.append((plane_num, roi_id))
+
+
+        # boosted_ids = [1055, 1150, 1168, 1172, 226, 247, 314, 498, 552, 660, 756, 877, 910, 933]
+        # boosted_ids = [551]
+        # for idx in boosted_ids:
+        #     plane, roi = flat_map[idx]
+        #     print(f"dF_F index {idx} -> plane {plane}, Suite2p ROI {roi}")
+        return ops, dF_F, all_cells_indices, n_planes, iscell, TC_combined.T, dF_F_red
 
 class DenoiseData():
     def __init__(self, grating_indices):
         self.grating_indices = grating_indices
     
     def baseline_subtraction(self, zscore, zscore_red, trial_start_indices):
-        trial_start_frames =15
+        trial_start_frames = 15
         for trial_idx in range(len(trial_start_indices) - 1): 
             start_idx = trial_start_indices[trial_idx] 
             end_idx = trial_start_indices[trial_idx + 1] 
-            baseline = np.median(zscore[start_idx : start_idx + trial_start_frames], axis=0)
+            baseline = np.mean(zscore[start_idx : start_idx + trial_start_frames], axis=0)
             zscore[start_idx:end_idx] -= baseline
 
         if zscore_red is not None and len(zscore_red) > 0:
@@ -601,25 +772,34 @@ class  DataProcessor:
         self.catchA = None
         self.activity = {}
         self.speed = None
+        self.lick = None
+        self.pupil = None
+        self.piezo_full = None
+        self.time_full = None
+        self.trial_start_indices_full = None
+        self.reward_indices_full = None
 
-    # DATA LOADING AND INITIALIZING VARIABLES
-    def preprocessing(self, table, sheet_name, neuropil_factor, ani, tri_perc, suite2ppath, behavior_data_path,basesub ):
+    def preprocessing(self, table, sheet_name, neuropil_factor, ani, tri_perc, suite2ppath, behavior_data_path,basesub, roitype):
         # Create DataLoader instance
         data_loader = DataLoader(behavior_data_path, sheet_name, suite2ppath)
         suite2p_loader = Suite2pLoader()
+        if roitype == 'manual':
+            roitype = table.iloc[ani][10]
 
         if table.iloc[ani][1] == 1:
             matlab_data = data_loader.load_matlab_data()
-            self.n_gratings, self.unpred_trials, self.pred_trials, self.trial_start_indices, self.grating_indices, self.position, num_bins, self.position_tunnel, \
-                self.n_trials, self.unpred_led, self.unpred_noled, self.catchA, self.catchB, self.speed = data_loader.load_matlab_variables(matlab_data)
-            ops, self.dff_Zscore, all_cells_indices, self.n_planes, iscell,self.TC, self.dff_Zscore_red = suite2p_loader.process_suite2p_data(suite2ppath, neuropil_factor)
+            self.n_gratings, self.unpred_trials, self.pred_trials, self.trial_start_indices, self.grating_indices, self.reward_indices, self.position, num_bins, self.position_tunnel, \
+                self.n_trials, self.unpred_led, self.unpred_noled, self.catchA, self.catchB, self.speed, self.lick, self.pupil = data_loader.load_matlab_variables(matlab_data)
+            ops, self.dff_Zscore, all_cells_indices, self.n_planes, iscell,self.TC, self.dff_Zscore_red = suite2p_loader.process_suite2p_data(suite2ppath,neuropil_factor,roitype)
             print('matlab done')
-        else:
+
+        else:  
             analog_time, analog_data, fs_analog = data_loader.load_analog_data()
             digital_time, digital_data, fs_digital = data_loader.load_digital_data()
-            ops, self.dff_Zscore, all_cells_indices, self.n_planes, iscell,self.TC, self.dff_Zscore_red = suite2p_loader.process_suite2p_data(suite2ppath, neuropil_factor)
+
+            ops, self.dff_Zscore, all_cells_indices, self.n_planes, iscell,self.TC, self.dff_Zscore_red = suite2p_loader.process_suite2p_data(suite2ppath, neuropil_factor, roitype)
             encoder_csv_data, vr_csv_data, events_csv_data, counter_csv_data, quadsync_csv_data, self.log_file, pupil_data = data_loader.load_csv_data()
-            downsampled_data, all_pupil_data = data_loader.align_events(digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data,pupil_data, analog_data, fs_analog, fs_digital, self.n_planes)
+            downsampled_data, all_pupil_data,self.piezo_full, self.time_full, self.trial_start_indices_full, self.reward_indices_full = data_loader.align_events(digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data,pupil_data, analog_data, fs_analog, fs_digital, self.n_planes)
             self.n_gratings,self.aligned_data, self.grating_indices, self.reward_indices, self.n_trials, self.trial_types, self.trial_start_indices, self.pred_trials, self.unpred_trials = data_loader.align_data(downsampled_data, self.dff_Zscore)
             print('bonsai done')
 
@@ -635,14 +815,15 @@ class  DataProcessor:
         for gr, _ in self.grating_indices.items():
             self.activity[gr] = self.dff_Zscore[:,self.grating_indices[gr]]
 
-def main(ani, table,sheet_name, neuropil_factor, tri_perc, basesub = 0):
+
+def main(ani, table,sheet_name, neuropil_factor, tri_perc, basesub = 0, roitype = 'suite2p'):
     suite2ppath = table.iloc[ani][5]  
     behavior_data_path = table.iloc[ani][2]
-    
     data_processor = DataProcessor()
-    data_processor.preprocessing(table, sheet_name, neuropil_factor, ani, tri_perc, suite2ppath, behavior_data_path, basesub)
+    data_processor.preprocessing(table, sheet_name, neuropil_factor, ani, tri_perc, suite2ppath, behavior_data_path, basesub, roitype)
 
     return ani, data_processor
 
 if __name__ == "__main__":
     main()
+

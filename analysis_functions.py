@@ -36,86 +36,125 @@ def sliding_window_projection(data, pca, window_size=5, step_size=1):
     
     return np.array(projected_points)
 
-def plot_shaded_error(axes, x_vals, data, color='k', label=None, alpha=0.2, ylim=None, title=None,style=None):
-    """Plot mean with shaded error bars (std) on given axes."""
-    mean_vals = np.nanmean(data, axis=0)
-    std_vals = np.nanstd(data, axis=0) / np.sqrt(len(mean_vals))
+def zscore_trialwise(pupil_trials, baseline_frames=slice(0, 10)):
+    base = np.nanmean(pupil_trials[:, baseline_frames], axis=1, keepdims=True)
+    sd   = np.nanstd(pupil_trials[:, baseline_frames], axis=1, keepdims=True) + 1e-9
+    return (pupil_trials - base) / sd
 
-    if style == 'smooth':
-        window_size = 3
-        mean_vals = savgol_filter(mean_vals, window_length=window_size, polyorder=1)
-        std_vals = savgol_filter(std_vals, window_length=window_size, polyorder=1)
-
-    linestyle = '--' if style == 'dash' else '-'
+# def linear_svm(X_A, X_B, X_early, X_late, kfolds=10, perc_pca=0.8):
+#     # dataine A and B data
+#     X = np.concatenate([X_A, X_B], axis=0)
+#     y = np.zeros(X.shape[0])
+#     y[X_A.shape[0]:] = 1  # Assign labels (0 for A, 1 for B)
     
-    axes.plot(x_vals, mean_vals, color=color, label=label, linestyle=linestyle, linewidth=2)
-    axes.fill_between(x_vals, mean_vals - std_vals, mean_vals + std_vals, color=color, alpha=alpha)
+#     acc_list = []
+#     confusion_matrices = []
+#     early_misclass = []
+#     late_misclass = []
+#     skf = StratifiedKFold(n_splits=kfolds, shuffle=True)
+#     param_grid = {'C': [0.001, 0.01, 0.1, 1, 10, 100]}
+#     for train_idx, test_idx in skf.split(X, y):
+#     # for _ in range(kfolds):
+#         # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1)
+#         X_train, X_test = X[train_idx], X[test_idx]
+#         y_train, y_test = y[train_idx], y[test_idx]
+#         pca = PCA(n_components=perc_pca)
+#         X_train_pca = pca.fit_transform(X_train)
+#         X_test_pca = pca.transform(X_test)
+#         svm = LinearSVC(penalty='l2', dual=False, C=0.001, class_weight='balanced', max_iter=5000)
+#         svm.fit(X_train_pca, y_train)
+#         y_pred = svm.predict(X_test_pca)
+        
+#         svm = LinearSVC(dual=False, class_weight='balanced', max_iter=5000)
+#         grid_search = GridSearchCV(svm, param_grid, cv=6, scoring='accuracy', n_jobs=-1)
+#         grid_search.fit(X_train_pca, y_train)
+#         svm = grid_search.best_estimator_  # Best model
+#         # print(f"Best C: {grid_search.best_params_['C']}")
+#         y_pred = svm.predict(X_test_pca)
 
-    if ylim:
-        axes.set_ylim(ylim)
-    if label:
-        axes.legend()
-    if title:
-        axes.set_title(title)
+#         acc_list.append(accuracy_score(y_pred, y_test))
+        
+#         cm = confusion_matrix(y_test, y_pred, normalize = 'true')
+#         cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
+#         confusion_matrices.append(cm)
 
-def linear_svm(X_A, X_B, X_early, X_late, kfolds=10, perc_pca=0.8):
-    # dataine A and B data
-   
-    X = np.concatenate([X_A, X_B], axis=0) # Concatenate data --- generally the predicted trials
-    y = np.zeros(X.shape[0]) 
-    y[X_A.shape[0]:] = 1  # Assign labels (0 for A, 1 for B)   # X is the data, Y is the labels
+#         early_pred = svm.predict(pca.transform(X_early))
+#         late_pred = svm.predict(pca.transform(X_late))
+#         early_misclass.append(np.sum(early_pred) / X_early.shape[0])
+#         late_misclass.append(np.sum(late_pred) / X_late.shape[0])
+
+#     avg_confusion_matrix = np.mean(confusion_matrices, axis=0)
     
-    # Containers to store results
-    acc_list = []              # Classification accuracy for each fold
-    confusion_matrices = []    # Confusion matrix for each fold
-    early_misclass = []        # Proportion of early trials misclassified as B
-    late_misclass = []         # Proportion of late trials misclassified as B
+#     # print(np.mean(acc_list))
+#     return acc_list, avg_confusion_matrix, early_misclass, late_misclass
 
-     # Stratified K-Fold to keep A/B ratio balanced across folds
-    skf = StratifiedKFold(n_splits=kfolds, shuffle=True) # 相当于K fold的crossvalidate，分成10份每次9个用来train一个用来test
+def linear_svm(X_A, X_B, X_early, X_late, kfolds=10, perc_pca=0.8, return_decision_scores=False):
+    # Combine A and B data
+    X = np.concatenate([X_A, X_B], axis=0)
+    y = np.zeros(X.shape[0])
+    y[X_A.shape[0]:] = 1  # Assign labels (0 for A, 1 for B)
     
-    # Parameter grid for regularization strength (C)
+    acc_list = []
+    confusion_matrices = []
+    early_misclass = []
+    late_misclass = []
+    early_decision_scores = []  # New
+    late_decision_scores = []   # New
+    
+    skf = StratifiedKFold(n_splits=kfolds, shuffle=True)
     param_grid = {'C': [0.001, 0.01, 0.1, 1, 10, 100]}
-
-    for train_idx, test_idx in skf.split(X, y):  # for loop for k times, each time use different train_idx & test_idx
-
-        # Split into train and test sets
+    
+    for train_idx, test_idx in skf.split(X, y):
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
-        pca = PCA(n_components=perc_pca) # n_components = perc_pca (here 0.8) means keeping enough PCs so the accumulated explained variance is more than 80%
-        X_train_pca = pca.fit_transform(X_train)  # fit using X_train, then project X_train to the new space
+        pca = PCA(n_components=perc_pca)
+        X_train_pca = pca.fit_transform(X_train)
         X_test_pca = pca.transform(X_test)
-
-        # Train a rough Linear SVM with fixed parameters --- not the best model so not used
         svm = LinearSVC(penalty='l2', dual=False, C=0.001, class_weight='balanced', max_iter=5000)
         svm.fit(X_train_pca, y_train)
         y_pred = svm.predict(X_test_pca)
         
-        # Grid search to find the best C on the training set --- the best model
         svm = LinearSVC(dual=False, class_weight='balanced', max_iter=5000)
         grid_search = GridSearchCV(svm, param_grid, cv=6, scoring='accuracy', n_jobs=-1)
         grid_search.fit(X_train_pca, y_train)
         svm = grid_search.best_estimator_  # Best model
-        y_pred = svm.predict(X_test_pca)
-
-        acc_list.append(accuracy_score(y_pred, y_test)) # accuracy score of the model above
         
-        # Compute normalized confusion matrix (row = true class, col = predicted class)
-        cm = confusion_matrix(y_test, y_pred, normalize = 'true')
+        y_pred = svm.predict(X_test_pca)
+        acc_list.append(accuracy_score(y_pred, y_test))
+        
+        cm = confusion_matrix(y_test, y_pred, normalize='true')
         cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
         confusion_matrices.append(cm)
-
-        early_pred = svm.predict(pca.transform(X_early)) # Predict how many early trials are classified as B
-        late_pred = svm.predict(pca.transform(X_late))  # Predict how many late trials are classified as B
-        early_misclass.append(np.sum(early_pred) / X_early.shape[0]) # classified as B y=1, as A y=0
+        
+        # Get both predictions and decision scores
+        early_pred = svm.predict(pca.transform(X_early))
+        late_pred = svm.predict(pca.transform(X_late))
+        early_misclass.append(np.sum(early_pred) / X_early.shape[0])
         late_misclass.append(np.sum(late_pred) / X_late.shape[0])
-
-    # Compute the average confusion matrix across folds
+        
+        # Add decision scores
+        if return_decision_scores:
+            early_scores = svm.decision_function(pca.transform(X_early))
+            late_scores = svm.decision_function(pca.transform(X_late))
+            # early_scores = np.tanh(early_scores * 0.5)
+            # late_scores = np.tanh(late_scores * 0.5)
+            early_decision_scores.append(early_scores)
+            late_decision_scores.append(late_scores)
+    
     avg_confusion_matrix = np.mean(confusion_matrices, axis=0)
+    
+    if return_decision_scores:
+        # Average decision scores across CV folds
+        avg_early_scores = np.mean(early_decision_scores, axis=0)
+        avg_late_scores = np.mean(late_decision_scores, axis=0)
+        avg_early_scores = np.tanh(avg_early_scores * 0.5)
+        avg_late_scores = np.tanh(avg_late_scores * 0.5)
+        return acc_list, avg_confusion_matrix, early_misclass, late_misclass, avg_early_scores, avg_late_scores
+    else:
+        return acc_list, avg_confusion_matrix, early_misclass, late_misclass
+    
+def find_significant_neurons_ttest(act_tri, trial_subset, threshold, prestim_frames, poststim_frames,method='ttest'):
 
-    return acc_list, avg_confusion_matrix, early_misclass, late_misclass
-
-def find_significant_neurons(act_tri, trial_subset, threshold, prestim_frames, poststim_frames):
     significant_neurons = []
     pvalb2 = []
     thresh = []
@@ -127,16 +166,57 @@ def find_significant_neurons(act_tri, trial_subset, threshold, prestim_frames, p
         pvalb2.append(pval)
         mean_diff_early = np.mean(post_stim) - np.mean(pre_stim)
         thresh.append(int(mean_diff_early > threshold and np.mean(post_stim) > threshold))
-        if pval < alpha and np.mean(post_stim) > 0.3:
+        if pval < alpha and np.mean(post_stim) > threshold:
             significant_neurons.append(neuron)
 
-    return significant_neurons, pvalb2, thresh
+    return significant_neurons, pvalb2
+
+def find_significant_neurons_threshold(act_tri, trial_subset, threshold, prestim_frames, poststim_frames):
+    n_neurons = act_tri.shape[0]
+    significant_neurons = []
+    mean_diffs = []
+
+    for neuron in range(n_neurons):
+        pre_vals = act_tri[neuron, trial_subset][:, prestim_frames].flatten()
+        post_vals = act_tri[neuron, trial_subset][:, poststim_frames].flatten()
+        mean_pre = np.mean(pre_vals)
+        mean_post = np.mean(post_vals)
+        diff= mean_post - mean_pre
+        mean_diffs.append(diff)
+        if diff > threshold and mean_post > 0.2:
+            significant_neurons.append(neuron)
+
+    return significant_neurons, mean_diffs
+    
+def find_significant_neurons_bootstrap(  act_tri, trial_subset, threshold, prestim_frames, poststim_frames, n_bootstrap=1000, alpha=0.05, min_prob=0.5):
+    n_neurons = act_tri.shape[0]
+    n_trials = len(trial_subset)
+    significant_neurons = []
+    mean_diffs = []
+
+    for neuron in range(n_neurons):
+        diffs = []
+        for b in range(n_bootstrap):
+            resampled = np.random.choice(trial_subset, n_trials, replace=True)
+            pre_vals = act_tri[neuron, resampled][:, prestim_frames].flatten()
+            post_vals = act_tri[neuron, resampled][:, poststim_frames].flatten()
+            diffs.append(np.mean(post_vals) - np.mean(pre_vals))
+        
+        diffs = np.array(diffs)
+        mean_diffs.append(np.mean(diffs))
+        
+        lo, hi = np.percentile(diffs, [100*alpha/2, 100*(1-alpha/2)])
+        prob_pass = np.mean(diffs > threshold)
+        if lo > 0 and prob_pass >= min_prob:
+            significant_neurons.append(neuron)
+
+    return significant_neurons, mean_diffs
 
 def compute_si(blo2activity_stim1, blo2activity_stim2, pooled_neurons, poststim_frames):
-    resps1 = np.mean(blo2activity_stim1[pooled_neurons,:,poststim_frames],axis=2)
-    resps2 = np.mean(blo2activity_stim2[pooled_neurons,:,poststim_frames],axis=2)
-    mean1 = np.mean(resps1, axis=1)
-    mean2 = np.mean(resps2, axis=1)
+    resps1 = np.nanmean(blo2activity_stim1[pooled_neurons,:,poststim_frames],axis=2)
+    resps2 = np.nanmean(blo2activity_stim2[pooled_neurons,:,poststim_frames],axis=2)
+    mean1 = np.nanmean(resps1, axis=1)
+    mean2 = np.nanmean(resps2, axis=1)
     return (mean1 - mean2) / (mean1 + mean2)
 
 def train_svm_multiclass(X, y, kfolds=5):
@@ -151,7 +231,7 @@ def train_svm_multiclass(X, y, kfolds=5):
 
         pca = PCA(n_components=0.9)
         X_train_pca = pca.fit_transform(X_train)
-        X_test_pca = pca.transform(X_test) 
+        X_test_pca = pca.transform(X_test)
 
         svm = SVC(kernel='linear', C=0.1) 
         svm.fit(X_train_pca, y_train)
