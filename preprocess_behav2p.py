@@ -1,6 +1,6 @@
 # MODULES
 import os
-from os import path
+from os import path, replace
 import yaml
 from pathlib import Path
 from typing import Optional
@@ -13,6 +13,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import correlate
 from sklearn.linear_model import LinearRegression
 from skimage.measure import EllipseModel
+import matplotlib.pyplot as plt
 
 class DataLoader:
     def __init__(self, behavior_data_path, sheet_name, suite2ppath):
@@ -260,7 +261,97 @@ class DataLoader:
         best_offset = lags[np.argmax(corr)]
         return best_offset
 
-    def align_events(self, digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data, pupil_data,analog_data, fs_analog, fs_digital, n_planes):
+    def detect_scanner_time_from_pupil(self, camera_time, dlc_path, n_volumes_expected, fs_per_plane_expected, n_planes, min_run_frames=10, max_gap_frames=60):
+        """
+        Fallback for sessions where the scanner digital channel (P0.0) wasn't
+        recorded (e.g. after a DAQ power surge). Reconstructs per-frame
+        scanner timestamps using the fact that the pupil camera can't see the
+        pupil while the 2p scanner/laser is on -- so DLC tracking confidence
+        drops sharply for the duration of imaging, bracketing the imaging
+        epoch in the camera's (already-synced) time base. Within that
+        bracketed window, per-frame times are filled in via constant-rate
+        interpolation using the known frame count and frame rate from
+        Suite2p/ScanImage metadata (ops['nframes'], ops['fs']), since there
+        is no remaining signal that captures true scanner jitter.
+        """
+
+        x, y, p = self.load_dlc_points(dlc_path)
+
+        mean_p = np.nanmean(p, axis=1)
+        imaging_mask = mean_p >= 0.97
+
+        T = min(len(imaging_mask), len(camera_time))
+        imaging_mask = imaging_mask[:T]
+        cam_t = camera_time[:T]
+
+        diff = np.diff(imaging_mask.astype(int))
+        run_starts = np.where(diff == 1)[0] + 1
+        run_ends = np.where(diff == -1)[0] + 1
+        if imaging_mask[0]:
+            run_starts = np.r_[0, run_starts]
+        if imaging_mask[-1]:
+            run_ends = np.r_[run_ends, len(imaging_mask)]
+
+        run_lengths_raw = run_ends - run_starts
+
+        if len(run_starts) > 1:
+            merged_starts = [run_starts[0]]
+            merged_ends = [run_ends[0]]
+            for s, e in zip(run_starts[1:], run_ends[1:]):
+                gap = s - merged_ends[-1]
+                if gap <= max_gap_frames:
+                    merged_ends[-1] = e  # bridge: extend current run
+                else:
+                    merged_starts.append(s)
+                    merged_ends.append(e)
+            run_starts = np.array(merged_starts)
+            run_ends = np.array(merged_ends)
+
+        run_lengths = run_ends - run_starts
+        valid = run_lengths >= min_run_frames
+
+        diagnostics = {
+            "n_candidate_runs_raw": len(run_lengths_raw),
+            "run_lengths_raw": run_lengths_raw.tolist(),
+            "n_candidate_runs_after_merge": len(run_starts),
+            "n_valid_runs": int(valid.sum()),
+            "run_lengths": run_lengths.tolist(),
+            "max_gap_frames_used": max_gap_frames,
+        }
+
+        longest_idx = np.argmax(np.where(valid, run_lengths, -1))
+        start_idx, end_idx = run_starts[longest_idx], run_ends[longest_idx] - 1
+
+        imaging_start_time = cam_t[start_idx]
+        imaging_end_time = cam_t[end_idx]
+
+        diagnostics["chosen_run_length_frames"] = int(run_lengths[longest_idx])
+        diagnostics["start_camera_frame_idx"] = int(start_idx)
+        diagnostics["end_camera_frame_idx"] = int(end_idx)
+
+        epoch_duration = imaging_end_time - imaging_start_time
+        expected_duration = n_volumes_expected / fs_per_plane_expected
+        diagnostics["epoch_duration_from_pupil_s"] = epoch_duration
+        diagnostics["expected_duration_from_metadata_s"] = expected_duration
+        diagnostics["duration_discrepancy_s"] = epoch_duration - expected_duration
+        diagnostics["duration_discrepancy_pct"] = 100 * (epoch_duration - expected_duration) / expected_duration
+
+        # Build one timestamp PER SINGLE-PLANE FRAME (n_volumes_expected *
+        # n_planes total), at the single-plane sampling rate
+        # (fs_per_plane_expected * n_planes) -- this is the array shape
+        # decimate_dataframe expects, matching what detect_falling_edges on
+        # the real scanner digital channel would have produced (one falling
+        # edge per plane acquisition, n_planes of them per volume).
+        n_single_plane_frames = n_volumes_expected * n_planes
+        fs_single_plane = fs_per_plane_expected * n_planes
+        dt = 1.0 / fs_single_plane
+        scanner_time = imaging_start_time + dt * np.arange(n_single_plane_frames)
+        diagnostics["n_single_plane_frames_generated"] = n_single_plane_frames
+        diagnostics["scanner_time_end_vs_pupil_end_diff_s"] = scanner_time[-1] - imaging_end_time
+
+        return scanner_time, diagnostics
+
+    def align_events(self, digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data, pupil_data,analog_data, fs_analog, fs_digital, n_planes, n_frames_expected=None, fs_expected=None):
         # Align synchronization events between the GPU and the photodiode signal
         min_nidaq_sample = 10_000
         photodiode_signal_raw = self.extract_digital_channel(digital_data, 2)
@@ -271,11 +362,47 @@ class DataLoader:
         # extract scanner times
         scanner_signal = self.extract_digital_channel(digital_data, 0)
         scanner_time = self.detect_falling_edges(scanner_signal) / fs_digital # the end of a scanning cycle or acquisition frame.
-
         camera_signal = self.extract_digital_channel(digital_data, 6)  # P0.6
         camera_edges = self.detect_falling_edges(camera_signal) / fs_digital
         camera_time = np.asarray(camera_edges)  
 
+        # --- Fallback: scanner channel missing/empty (DAQ power surge) ---
+        scanner_time_diagnostics = None
+        scanner_time_is_reconstructed = False
+        if len(scanner_time) == 0:
+            print("WARNING: No scanner signal detected on P0.0 -- falling back to "
+                  "pupil-visibility-based scanner time reconstruction.")
+            dlc_path = self.find_pupil_dlc_output(self.behavior_data_path)
+            if dlc_path is None:
+                raise ValueError(
+                    "Scanner signal missing AND no DLC pupil output found -- "
+                    "cannot reconstruct scanner timing for this session. Manual "
+                    "intervention needed."
+                )
+            # NOTE: detect_scanner_time_from_pupil returns ONE TIMESTAMP PER
+            # SINGLE-PLANE FRAME (length n_frames_expected * n_planes), not
+            # per volume, since that's what decimate_dataframe expects (it
+            # downsamples by n_planes itself). Passing n_planes here 
+            scanner_time, scanner_time_diagnostics = self.detect_scanner_time_from_pupil(
+                camera_time, dlc_path, n_frames_expected, fs_expected, n_planes
+            )
+            scanner_time_is_reconstructed = True
+
+        # fig, axes = plt.subplots(8, 1, figsize=(15, 10), sharex=True)
+        # t = np.arange(len(digital_data)) / fs_digital
+
+        # for ch in range(8):
+        #     sig = self.extract_digital_channel(digital_data, ch)
+        #     axes[ch].plot(t, sig)
+        #     axes[ch].set_ylabel(f'P0.{ch}')
+        #     axes[ch].set_ylim(-0.1, 1.1)
+        #     axes[ch].set_xlim([5, 15])
+
+
+        # axes[-1].set_xlabel('Time (s)')
+        
+        # plt.tight_layout()
+        # plt.show()
         try:
             first_diode_time = diode_time[diode_time > (min_nidaq_sample / fs_digital)][0]
         except IndexError:
@@ -308,10 +435,8 @@ class DataLoader:
         # # #  combine events if thy happen on the same frame
         events_csv_data['EventKey'] = events_csv_data['Frame.Time'].astype(str) + '_' + events_csv_data['EventName']
         events_aggregated = events_csv_data.groupby(['Frame.Index', 'Frame.Time']).agg({'EventName': lambda x: ', '.join(x),'EventData': lambda x: ', '.join(x.astype(str))}).reset_index()
-        # events_aggregated = events_csv_data.groupby(['Frame.Index', 'Frame.Time']).agg({'EventName': lambda x: ', '.join(x), 'EventData': lambda x: ', '.join(x)}).reset_index() # combine events
-        averaged_vr_data = vr_csv_data.groupby('Index', as_index=False)['Position'].mean()#  average vr positions if they occur on the same frames:
-        averaged_encoder_data = encoder_csv_data.groupby('FrameIndex', as_index=False)['RotaryEncoder'].mean()#  average vr positions if they occur on the same frames:
-        #  merge with frame counters
+        averaged_vr_data = vr_csv_data.groupby('Index', as_index=False)['Position'].mean()
+        averaged_encoder_data = encoder_csv_data.groupby('FrameIndex', as_index=False)['RotaryEncoder'].mean()
         merged_data = counter_csv_data.merge( events_aggregated[['Frame.Index', 'EventName', 'EventData']], left_on='Index',  right_on='Frame.Index',  how='left')
         merged_data = merged_data.merge(averaged_vr_data, left_on='Index', right_on='Index',how='left')
         merged_data = merged_data.merge(averaged_encoder_data, left_on='Index', right_on='FrameIndex',how='left')
@@ -324,8 +449,7 @@ class DataLoader:
         speed_m_s = np.abs(v_m_s)
         speed_m_s = np.nan_to_num(speed_m_s, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Optional: deadband so stopped is exactly 0
-        stop_thresh_m_s = 0.01  # 1 cm/s
+        stop_thresh_m_s = 0.01
         speed_m_s[speed_m_s < stop_thresh_m_s] = 0.0
 
         merged_data["Speed_Absolute"] = speed_m_s
@@ -344,24 +468,25 @@ class DataLoader:
         stim_times = merged_data.loc[merged_data['Stim'] > 0, 'Time'].values
         merged_data['Time'] = gpu_2_photodiode_time(merged_data['Time'].values)  
         
-        # piezo_signal = analog_data[0, :]
         piezo_signal = analog_data[1 if analog_data.shape[0] > 2 else 0, :]
         piezo_time = np.arange(piezo_signal.shape[0]) / fs_analog
         indices = np.searchsorted(piezo_time, merged_data['Time'])
-        indices = np.clip(indices, 0, len(piezo_signal) - 1)  #ensure within valid range for indices
+        indices = np.clip(indices, 0, len(piezo_signal) - 1)
         merged_data['Piezo_Signal'] = piezo_signal[indices]
         trial_start_indices_full = merged_data[merged_data['Teleport'] == 1].index.tolist()
         reward_indices_full = merged_data[merged_data['Reward'] == 1].index.tolist()
-        # Pupil metadata
         pupil_data = pupil_data.copy()
         pupil_data["Frames"] = np.arange(len(pupil_data))
-        pupil_data["Time"] = pupil_data["Frames"] / 30.0  # camera FPS assumption
+        pupil_data["Time"] = pupil_data["Frames"] / 30.0
         data_path = os.path.join(self.behavior_data_path, 'data.pkl')
+        expected_n_volumes = len(scanner_time[::n_planes])
         if not os.path.exists(data_path):
             print("data not found. Processing data...")
             downsampled=self.decimate_dataframe(merged_data,scanner_time,n_planes) 
         else:
             downsampled = pd.read_pickle(data_path)
+            if len(downsampled) != expected_n_volumes:
+                downsampled = self.decimate_dataframe(merged_data, scanner_time, n_planes)
 
         pupil_cols = {"pupil_area", "pupil_diameter"} 
         has_pupil = pupil_cols.intersection(downsampled.columns)
@@ -377,12 +502,11 @@ class DataLoader:
                 try:
                     x, y, p = self.load_dlc_points(dlc_path)
                     T = x.shape[0]
-                    bin_starts = scanner_time[::n_planes]          # EXACT same as decimate_dataframe
+                    bin_starts = scanner_time[::n_planes]
                     t0, t1 = bin_starts[0], bin_starts[-1]
                     cam = np.asarray(camera_time)
                     j0 = np.searchsorted(cam, t0)
 
-                    # drop same frames from DLC as from camera pulses
                     if T > j0:
                         x, y, p = x[j0:], y[j0:], p[j0:]
                     else:
@@ -405,7 +529,6 @@ class DataLoader:
                     for k, v in pupil_metrics.items():
                         downsampled[k] = v
 
-                    # confirm camera frames per bin is ~4 (30 Hz cam / 7.5 Hz bins)
                     bin_idx = np.searchsorted(bin_starts, cam_frame_time, side="right") - 1
                     counts = np.bincount(
                         bin_idx[(bin_idx >= 0) & (bin_idx < len(bin_starts))],
@@ -415,10 +538,9 @@ class DataLoader:
                 except Exception as e:
                     print("WARNING: Failed to compute pupil metrics:", repr(e))
 
-        # --------------------------------------------------
         downsampled.to_pickle(os.path.join(self.behavior_data_path, "data.pkl"))
 
-        return downsampled, pupil_data, merged_data['Piezo_Signal'], merged_data['Time'], trial_start_indices_full, reward_indices_full
+        return downsampled, pupil_data, merged_data['Piezo_Signal'], merged_data['Time'], trial_start_indices_full, reward_indices_full, scanner_time_is_reconstructed, scanner_time_diagnostics
     
     def bin_and_average_dlc(self, x, y, p, cam_frame_time, bin_starts):
         T, n_pts = x.shape
@@ -442,25 +564,23 @@ class DataLoader:
         y_d = np.full((N, n_pts), np.nan)
         p_d = np.full((N, n_pts), np.nan)
 
-        # Loop only bins that actually receive frames (faster than range(N))
         for i in np.unique(bin_idx):
             m = bin_idx == i
             x_d[i] = np.nanmean(x[m], axis=0)
             y_d[i] = np.nanmean(y[m], axis=0)
-            # p_d[i] = np.nanmean(p[m], axis=0)
-            p_d[i] = np.mean(p[m] >= 0.97, axis=0)  # fraction of frames that passed threshold
+            p_d[i] = np.mean(p[m] >= 0.97, axis=0)
         return x_d, y_d, p_d
 
     def decimate_dataframe(self, df, scanner_times, nz, time_col_name='Time', binary_cols=['Lick','Reward','Teleport','Opto'], event_cols=['Stim','Teleport','Opto']):
-        start_idx = np.searchsorted(df[time_col_name].values, scanner_times) # align df timestamp to nearest falling edge of scanner frame
-        start_idx = start_idx[::nz]  # take every nz-th start index
+        start_idx = np.searchsorted(df[time_col_name].values, scanner_times)
+        start_idx = start_idx[::nz]
         stop_idx = np.append(start_idx[1:] - 1, len(df) - 1)
         for i in range(1, len(start_idx)): 
             if start_idx[i] == start_idx[i-1]:
                 stop_idx[i] = stop_idx[i-1] + 1
             elif stop_idx[i] <= start_idx[i]: 
                 stop_idx[i] = start_idx[i] + 1  
-        stop_idx[-1] = len(df) - 1 # change the last stop_idx to the end of the data
+        stop_idx[-1] = len(df) - 1
 
         resampled_data = []
         for start, stop in zip(start_idx, stop_idx):
@@ -486,25 +606,26 @@ class DataLoader:
         return decimated_df
     
     def align_frames(self,downsampled_data, dff_Zscore):
-        # Check if the number of detected frames matches the number of frames in roi_array
         if len(downsampled_data) != dff_Zscore.shape[1]:
             excess_frames = len(downsampled_data) - dff_Zscore.shape[1]
             if excess_frames > 0:
                 print(f"Detected {excess_frames} excess frames in the downsampled data. Discarding these frames.")
                 downsampled_data = downsampled_data.iloc[:-excess_frames]
             else:
-                raise ValueError("Mismatch between detected frames in scanner signal and ROI data frames.")
-        return downsampled_data.reset_index(drop=True)
+                missing_frames = -excess_frames
+                print(f"WARNING: behavior logging stopped before the "
+                      f"scanner did). Discarding the {missing_frames} trailing "
+                      f"imaging frames that have no corresponding behavior data. ")
+                dff_Zscore = dff_Zscore[:, :len(downsampled_data)]
+        return downsampled_data.reset_index(drop=True), dff_Zscore
     
     def align_data(self, downsampled_data, dff_Zscore):
-        aligned_data = self.align_frames(downsampled_data, dff_Zscore)
-        gratings_start = aligned_data[~aligned_data['Stim'].isin([0, np.nan])].index #np.unique(aligned_data['Stim'].dropna()) 
+        aligned_data, dff_Zscore = self.align_frames(downsampled_data, dff_Zscore)
+        gratings_start = aligned_data[~aligned_data['Stim'].isin([0, np.nan])].index
         gratings_start = gratings_start[np.r_[True, np.diff(gratings_start) > 2]]
         trial_start_indices = aligned_data[aligned_data['Teleport'] == 1].index.tolist()
-        # stim_type = stim_type = aligned_data.loc[gratings_start, 'Stim'].reset_index(drop=False)
         opto_stim = aligned_data[aligned_data['Opto'] == 1].index.tolist()
-        # reward_delivery = aligned_data[aligned_data['Reward'] == 1].index.tolist()
-        condition = (gratings_start > trial_start_indices[0]) & (gratings_start < trial_start_indices[-1]) # all gratings after the first trial ends (because scanner starts during), and all before the end of the last trial
+        condition = (gratings_start > trial_start_indices[0]) & (gratings_start < trial_start_indices[-1])
         gratings_start = gratings_start[condition]
         
         reward_bins = np.asarray(aligned_data.index[aligned_data['Reward'] == 1])
@@ -516,15 +637,12 @@ class DataLoader:
             r = reward_bins[(reward_bins >= a) & (reward_bins < b)]
             reward_delivery.append(int(r[0]) if len(r) else None)
 
-        # keep only trials with a detected reward (should be all, if your assumption holds)
         reward_delivery = [r for r in reward_delivery if r is not None]
         log_file = os.path.join(self.behavior_data_path,'TrialLogging.yaml')
         trial_types = np.array(self.extract_trial_type(log_file,'trialTypeLabel')[1:])
         
         n_trials = max(len(trial_start_indices) - 1, 1)
         n_gratings = round(len(gratings_start) / n_trials)
-        # n_gratings = round(len(gratings_start)/len(trial_start_indices))
-        # group grating onsets        
         grating_onsets_dict = {f'gr_{i+1}': [] for i in range(n_gratings)}
         for i, idx in enumerate(gratings_start):
             grating_num = (i % n_gratings) + 1
@@ -535,7 +653,7 @@ class DataLoader:
         total_frames = pre_frames + post_frames
 
         time_values = aligned_data['Time'].values
-        dt = dt = 7.9 / total_frames  
+        dt = 7.9 / total_frames  
         grating_indices = {}
 
         for grating, onset_indices  in grating_onsets_dict.items():
@@ -553,7 +671,7 @@ class DataLoader:
         total_frames = pre_frames + post_frames
 
         time_values = aligned_data["Time"].values
-        dt = np.nanmedian(np.diff(time_values))  # works for 30 Hz or 15 Hz sessions
+        dt = np.nanmedian(np.diff(time_values))
 
         reward_indices = []
         for ridx in reward_delivery:
@@ -563,29 +681,23 @@ class DataLoader:
             idxs = np.clip(idxs, 0, len(time_values) - 1)
             reward_indices.append(idxs)
         
-        # define trial types
-
         n_trial_types = trial_types.max()+1
         tt_mat = np.zeros((n_trials, n_trial_types), dtype=int)
         tt_mat[np.arange(n_trials), trial_types[:n_trials]] = 1
 
         unpred_trials = {f'gr_{i+1}': [] for i in range(n_gratings)}
-        # unpred_trials['gr_2'] = np.sort(np.concatenate((np.where(tt_mat[:,3])[0],np.where(tt_mat[:,2])[0])))        
-        # unpred_trials['gr_4'] = np.sort(np.concatenate((np.where(tt_mat[:,5])[0],np.where(tt_mat[:,2])[0])))
         all_stimuli = set(np.unique(aligned_data['Stim'].dropna()))
-        expected_stim_set = {2, 4}  # always expected
+        expected_stim_set = {2, 4}
         unpred_stim_set = all_stimuli - expected_stim_set
-        # unpred_trials = {f'gr_{i+1}': [] for i in range(n_gratings)}
         pred_trials = []
 
         for gr, indices in grating_onsets_dict.items():
             for i, idx in enumerate(indices):
                 if aligned_data.loc[idx, 'Stim'] in unpred_stim_set:
-                    unpred_trials[gr].append(i)  # Use dynamic gr key
+                    unpred_trials[gr].append(i)
                 else:
                     pred_trials.append(i)
-        ##
-        return n_gratings,aligned_data, grating_indices, reward_indices, n_trials, tt_mat, trial_start_indices, pred_trials, unpred_trials
+        return n_gratings,aligned_data, grating_indices, reward_indices, n_trials, tt_mat, trial_start_indices, pred_trials, unpred_trials, dff_Zscore
     
 class Suite2pLoader:
     def process_suite2p_data(self, suite2ppath, neuropil_factor,roitype):
@@ -612,12 +724,8 @@ class Suite2pLoader:
                 TC_plane = (F) - (neuropil_factor * (Fneu))
             
             elif roitype == 'manual_imagej':
-                f_red_path = os.path.join(plane_path, 'F_red.npy')
-                if not os.path.exists(f_red_path):
-                    print(f"No F_red.npy in plane{plane_num}, skipping.")
-                    continue
-                F = np.load(f_red_path)
-                Fneu = np.load(os.path.join(plane_path, 'Fneu_red.npy'))
+                F = np.load(os.path.join(plane_path, 'F_red.npy')) 
+                Fneu = np.load(os.path.join(plane_path, 'Fneu_red.npy')) 
                 TC_plane = (F) - (neuropil_factor * (Fneu))
             
             elif roitype == 'suite2p':
@@ -625,23 +733,14 @@ class Suite2pLoader:
                 Fneu = np.load(os.path.join(plane_path, 'Fneu.npy')) 
                 F = F[cells_indices,:]
                 Fneu = Fneu[cells_indices, :]
-                # # if table == 2:
-                # min_val = np.min([F.min(), Fneu.min()])  # fixed
-                # if min_val < 0:
-                #     offset = abs(min_val) 
-                #     F += offset +20
-                #     Fneu += offset+20
-                
-                
                 TC_plane = (F) - (neuropil_factor * (Fneu))
             elif roitype == 'aligned':
-                F = np.load(os.path.join(plane_path, 'F_aligned.npy')) 
-                # min_val = np.min([F.min()])  # fixed
-                # if min_val < 0:
-                #     offset = abs(min_val) 
-                #     F += offset +10
-                TC_plane = F
-                
+                try:
+                    F = np.load(os.path.join(plane_path, 'F_aligned.npy'))
+                    TC_plane = F
+                except FileNotFoundError:
+                    continue
+
             all_TC.append(TC_plane.T) 
             all_cells_indices.append(cells_indices)
             try:
@@ -678,18 +777,11 @@ class Suite2pLoader:
                     padding_size = max_columns - dF_F_red[i].shape[1]
                     dF_F_red[i] = np.hstack([dF_F_red[i], np.full((dF_F_red[i].shape[0], padding_size), np.nan)])
             dF_F_red = np.vstack(dF_F_red)
-        # reconstruct the flat mapping from dF_F index -> (plane, suite2p ROI id)
-        flat_map = []  # list of (plane, suite2p_roi_id)
-        for plane_num, cell_ids in enumerate(all_cells_indices):  # all_cells_indices for animal 17
+        flat_map = []
+        for plane_num, cell_ids in enumerate(all_cells_indices):
             for roi_id in cell_ids:
                 flat_map.append((plane_num, roi_id))
 
-
-        # boosted_ids = [1055, 1150, 1168, 1172, 226, 247, 314, 498, 552, 660, 756, 877, 910, 933]
-        # boosted_ids = [551]
-        # for idx in boosted_ids:
-        #     plane, roi = flat_map[idx]
-        #     print(f"dF_F index {idx} -> plane {plane}, Suite2p ROI {roi}")
         return ops, dF_F, all_cells_indices, n_planes, iscell, TC_combined.T, dF_F_red
 
 class DenoiseData():
@@ -733,7 +825,6 @@ class DenoiseData():
                     X = np.arange(len(tdtomsig))
                     slope, intercept = np.polyfit(X, tdtomsig, 1)
                     predicted_values = intercept + slope * X
-                    # Calculate the noise distribution
                     noise_dist = np.abs(tdtomsig - predicted_values)
                     mean_val = np.mean(noise_dist)
                     std_dev = np.std(noise_dist)
@@ -749,7 +840,6 @@ class DenoiseData():
 
 class  DataProcessor:
     def __init__(self):
-        # Define instance variables
         self.n_gratings = None
         self.trial_start_indices = None
         self.grating_indices = None
@@ -778,9 +868,10 @@ class  DataProcessor:
         self.time_full = None
         self.trial_start_indices_full = None
         self.reward_indices_full = None
+        self.scanner_time_is_reconstructed = False
+        self.scanner_time_diagnostics = None
 
     def preprocessing(self, table, sheet_name, neuropil_factor, ani, tri_perc, suite2ppath, behavior_data_path,basesub, roitype):
-        # Create DataLoader instance
         data_loader = DataLoader(behavior_data_path, sheet_name, suite2ppath)
         suite2p_loader = Suite2pLoader()
         if roitype == 'manual':
@@ -799,16 +890,18 @@ class  DataProcessor:
 
             ops, self.dff_Zscore, all_cells_indices, self.n_planes, iscell,self.TC, self.dff_Zscore_red = suite2p_loader.process_suite2p_data(suite2ppath, neuropil_factor, roitype)
             encoder_csv_data, vr_csv_data, events_csv_data, counter_csv_data, quadsync_csv_data, self.log_file, pupil_data = data_loader.load_csv_data()
-            downsampled_data, all_pupil_data,self.piezo_full, self.time_full, self.trial_start_indices_full, self.reward_indices_full = data_loader.align_events(digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data,pupil_data, analog_data, fs_analog, fs_digital, self.n_planes)
-            self.n_gratings,self.aligned_data, self.grating_indices, self.reward_indices, self.n_trials, self.trial_types, self.trial_start_indices, self.pred_trials, self.unpred_trials = data_loader.align_data(downsampled_data, self.dff_Zscore)
+            n_frames_expected = self.dff_Zscore.shape[1] # frame count / rate from Suite2p metadata if the scanner DAQ is missing for this session.
+            fs_expected = ops.get('fs', None)
+            downsampled_data, all_pupil_data,self.piezo_full, self.time_full, self.trial_start_indices_full, self.reward_indices_full, self.scanner_time_is_reconstructed, self.scanner_time_diagnostics = data_loader.align_events(digital_data, counter_csv_data, events_csv_data, quadsync_csv_data, vr_csv_data, encoder_csv_data,pupil_data, analog_data, fs_analog, fs_digital, self.n_planes, n_frames_expected=n_frames_expected, fs_expected=fs_expected)
+            self.n_gratings,self.aligned_data, self.grating_indices, self.reward_indices, self.n_trials, self.trial_types, self.trial_start_indices, self.pred_trials, self.unpred_trials, self.dff_Zscore = data_loader.align_data(downsampled_data, self.dff_Zscore)
+            n_frames_aligned = self.dff_Zscore.shape[1]
+            if self.dff_Zscore_red is not None and len(self.dff_Zscore_red) > 0 and self.dff_Zscore_red.shape[1] != n_frames_aligned:
+                self.dff_Zscore_red = self.dff_Zscore_red[:, :n_frames_aligned]
+            if self.TC is not None and self.TC.shape[0] != n_frames_aligned:
+                self.TC = self.TC[:n_frames_aligned, :]
             print('bonsai done')
 
         self.denoiser = DenoiseData(self.grating_indices)
-        # if self.unpred_trials:
-        #     stability_unpred, self.filter_unpred, true_unpred_indices = self.denoiser.filter_trials(tri_perc, self.basesub_activity,self.basesub_activity_red, self.unpred_trials)
-        # else:
-        #     self.filter_unpred = []
-        # stability_pred, self.filter_pred, true_pred_indices = self.denoiser.filter_trials(tri_perc, self.basesub_activity, self.basesub_activity_red, self.pred_trials)
         if basesub == 1:
             self.dff_Zscore, self.dff_Zscore_red = self.denoiser.baseline_subtraction(self.dff_Zscore, self.dff_Zscore_red, self.trial_start_indices)
 
@@ -822,8 +915,12 @@ def main(ani, table,sheet_name, neuropil_factor, tri_perc, basesub = 0, roitype 
     data_processor = DataProcessor()
     data_processor.preprocessing(table, sheet_name, neuropil_factor, ani, tri_perc, suite2ppath, behavior_data_path, basesub, roitype)
 
+    if data_processor.scanner_time_is_reconstructed:
+        print(f"NOTE: animal index {ani} used pupil-based scanner_time reconstruction "
+              f"(scanner DAQ channel was missing). Diagnostics: "
+              f"{data_processor.scanner_time_diagnostics}")
+
     return ani, data_processor
 
 if __name__ == "__main__":
     main()
-

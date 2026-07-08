@@ -77,7 +77,7 @@ def plot_unexp_psth(data, sig_cells, ani_range, conditions, t_frames=None, figsi
         
         if animal_averages:
             cond_data = np.array(animal_averages)
-            plot_shaded_error(axes, range(t_frames), cond_data, color=cond['color'], alpha=0.2, style='smooth', label=f"{cond['label']} (n={len(animal_averages)} sessions, 4 animals)")
+            plot_shaded_error(axes, range(t_frames), cond_data, color=cond['color'], alpha=0.2, style='smooth', label=f"{cond['label']} (n={len(animal_averages)} sessions)")
     
     axes.set_ylabel('z-ΔF/F', fontsize=13)
     axes.set_xlabel('Time (s)', fontsize=13)

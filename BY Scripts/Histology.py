@@ -4,9 +4,10 @@ import numpy as np
 from bg_atlasapi import BrainGlobeAtlas
 
 # ── path ──────────────────────────────────────────────────
-REG_ATLAS  = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\histology\BY_DiI\BY_DI3\registration\reg_01__2026_04_30_a\registered_atlas.tiff"
-BOUNDARIES = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\histology\BY_DiI\BY_DI3\registration\reg_01__2026_04_30_a\boundaries.tiff"
-HISTOLOGY  = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\histology\BY_DiI\BY_DI3\downsampled_stacks\025_micron\ds_BY_DI3_260424_122144_25_25_ch03_chan_3_green.tif"
+REG_ATLAS  = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\dreadds\LC_Dreadds_1\brainsaw\registration\reg_01__2026_02_04_a\registered_atlas.tiff"
+BOUNDARIES = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\dreadds\LC_Dreadds_1\brainsaw\registration\reg_01__2026_02_04_a\boundaries.tiff"
+HISTOLOGY  = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\dreadds\LC_Dreadds_1\brainsaw\downsampled_stacks\025_micron\ds_sample_348dreadds_260202_111849_25_25_ch03_chan_3_green.tif"
+BACKGROUND = r"Y:\public\projects\SaEl_20220201_VIP\2pdata\LC\dreadds\LC_Dreadds_1\brainsaw\downsampled_stacks\025_micron\ds_sample_348dreadds_260202_111849_25_25_ch04_chan_4_blue.tif"
 
 # ── load ──────────────────────────────────────────────
 print("Loading atlas...")
@@ -16,6 +17,7 @@ print("Loading volumes...")
 atlas_vol  = tifffile.imread(REG_ATLAS)
 boundaries = tifffile.imread(BOUNDARIES)
 histology  = tifffile.imread(HISTOLOGY)
+background  = tifffile.imread(BACKGROUND)
 
 # ── transform boundaries and atlas_vol ──
 atlas_vol  = atlas_vol[::-1, :, ::-1]   # reverse slices + horizontally transform
@@ -24,13 +26,18 @@ boundaries = boundaries[::-1, :, ::-1]  # reverse slices + horizontally transfor
 # ── open napari ───────────────────────────────────────────
 viewer = napari.Viewer(title="Brain Region Explorer")
 
-viewer.add_image(histology, name="histology (green)",
+viewer.add_image(histology, name="histology",
                  colormap="green",
                  opacity=1.0,
-                 blending="opaque")
+                 blending="additive")
+
+viewer.add_image(background, name="background",
+                 colormap="blue",
+                 opacity=1.0,
+                 blending="additive")
 
 viewer.add_image(boundaries, name="boundaries",
-                 colormap="gray", opacity=0.5,
+                 colormap="gray", opacity=0.2,
                  blending="additive")
 
 # ── click & print brain region ──────────────────────────────────

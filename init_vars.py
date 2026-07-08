@@ -125,7 +125,7 @@ def init_trial_blocks(unpred_gratings, max_tr=4):
     blo1, blo2 = {}, {}
     for ind, gr in enumerate(unpred_gratings):
         blo1[f"X{ind}"] = unpred_gratings[gr][:max_tr]
-        blo2[f"X{ind}"] = unpred_gratings[gr][15:15+max_tr]
+        blo2[f"X{ind}"] = unpred_gratings[gr][16:16+max_tr]
         # blo2[f"X{ind}"] = unpred_gratings[gr][-20:-20+max_tr]
     return blo1, blo2
 
