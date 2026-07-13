@@ -219,12 +219,13 @@ def compute_si(blo2activity_stim1, blo2activity_stim2, pooled_neurons, poststim_
     mean2 = np.nanmean(resps2, axis=1)
     return (mean1 - mean2) / (mean1 + mean2)
 
-def train_svm_multiclass(X, y, kfolds=5):
+def train_svm_multiclass(X, y, kfolds=5, seed=0):
+    rng = np.random.RandomState(seed)
     acc = []
     acc_shuff = []
     confusion_matrices = []
+    skf = StratifiedKFold(n_splits=kfolds, shuffle=True, random_state=seed)
 
-    skf = StratifiedKFold(n_splits=kfolds, shuffle=True)
     for train_idx, test_idx in skf.split(X, y):
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
@@ -233,14 +234,16 @@ def train_svm_multiclass(X, y, kfolds=5):
         X_train_pca = pca.fit_transform(X_train)
         X_test_pca = pca.transform(X_test)
 
-        svm = SVC(kernel='linear', C=0.1) 
+        svm = SVC(kernel='linear', C=0.1)
         svm.fit(X_train_pca, y_train)
+
         y_pred = svm.predict(X_test_pca)
         acc.append(accuracy_score(y_test, y_pred))
-        
-        svm_shuff = SVC(kernel='linear', C=0.01) 
-        y_train_shuffled = np.random.permutation(y_train)
-        svm_shuff.fit(X_train_pca,y_train_shuffled)
+
+        # shuffled baseline
+        y_train_shuffled = rng.permutation(y_train)
+        svm_shuff = SVC(kernel='linear', C=0.1)
+        svm_shuff.fit(X_train_pca, y_train_shuffled)
         yshuff_pred = svm_shuff.predict(X_test_pca)
         acc_shuff.append(accuracy_score(y_test, yshuff_pred))
         cm = confusion_matrix(y_test, y_pred)

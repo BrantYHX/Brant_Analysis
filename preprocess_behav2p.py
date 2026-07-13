@@ -478,6 +478,7 @@ class DataLoader:
         pupil_data = pupil_data.copy()
         pupil_data["Frames"] = np.arange(len(pupil_data))
         pupil_data["Time"] = pupil_data["Frames"] / 30.0
+        merged_data.to_pickle(os.path.join(self.behavior_data_path, "behavior_data_nonsampled.pkl"))
         data_path = os.path.join(self.behavior_data_path, 'data.pkl')
         expected_n_volumes = len(scanner_time[::n_planes])
         if not os.path.exists(data_path):
@@ -735,12 +736,9 @@ class Suite2pLoader:
                 Fneu = Fneu[cells_indices, :]
                 TC_plane = (F) - (neuropil_factor * (Fneu))
             elif roitype == 'aligned':
-                try:
-                    F = np.load(os.path.join(plane_path, 'F_aligned.npy'))
-                    TC_plane = F
-                except FileNotFoundError:
-                    continue
-
+                F = np.load(os.path.join(plane_path, 'F_aligned.npy')) 
+                TC_plane = F
+                
             all_TC.append(TC_plane.T) 
             all_cells_indices.append(cells_indices)
             try:

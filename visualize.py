@@ -2,7 +2,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import analysis_functions as af
 from scipy.signal import savgol_filter
-from scipy.ndimage import gaussian_filter1d
 from scipy.stats import sem
 from matplotlib import font_manager
 import seaborn as sns
@@ -77,7 +76,7 @@ def plot_unexp_psth(data, sig_cells, ani_range, conditions, t_frames=None, figsi
         
         if animal_averages:
             cond_data = np.array(animal_averages)
-            plot_shaded_error(axes, range(t_frames), cond_data, color=cond['color'], alpha=0.2, style='smooth', label=f"{cond['label']} (n={len(animal_averages)} sessions)")
+            plot_shaded_error(axes, range(t_frames), cond_data, color=cond['color'], alpha=0.2, style='smooth', label=f"{cond['label']} (n={len(animal_averages)} sessions, 1 animals)")
     
     axes.set_ylabel('z-ΔF/F', fontsize=13)
     axes.set_xlabel('Time (s)', fontsize=13)
@@ -281,26 +280,19 @@ def plot_adapt_bin_pad_acrosscells(data, sig_cells, poststim_frames, ani_range,u
     
     return fig, ax
 
-def plot_heatmaps(data, ani_range, conditions, poststim_frames, max_tri=15,figsize=(12,6), vmin=-1, vmax=1, sort_by='self',label='axonal bouton'):
+def plot_heatmaps(data, ani_range, conditions, poststim_frames, max_tri=16,figsize=(12,6), vmin=-1, vmax=1, sort_by='self',label='axonal boutons'):
     condition_data = []
     for cond in conditions:
         cond_list = []
         for ani in ani_range:
             if cond['type'] == 'predicted':
-                trials = iv.sparse_pred_trials(data[ani], data[ani]['unpred_trials'], max_tri, method='complex')
+                trials = iv.sparse_pred_trials(data[ani], data[ani]['unpred_trials'], max_tri, method='simple')
             elif cond['type'] == 'unpred':
                 trials = data[ani]['unpred_trials']['gr_2'][:max_tri]
-            elif cond['type'] == 'difference':
-                early_trials = data[ani]['unpred_trials']['gr_2'][:max_tri]
-                late_trials = data[ani]['unpred_trials']['gr_2'][-max_tri:]
-                early_data = np.mean(data[ani]['activity'][cond['activity']][:, early_trials, :], axis=1)
-                late_data = np.mean(data[ani]['activity'][cond['activity']][:, late_trials, :], axis=1)
-                cond_list.append(early_data - late_data)
-                continue
-            
-            if cond['type'] != 'difference':
-                cond_list.append(np.mean(data[ani]['activity'][cond['activity']][:, trials, :], axis=1))
-        
+            elif cond['type'] == 'unpred_late':
+                trials = data[ani]['unpred_trials']['gr_2'][16:16+max_tri]
+
+            cond_list.append(np.mean(data[ani]['activity'][cond['activity']][:, trials, :], axis=1))
         condition_data.append(np.concatenate(cond_list, axis=0))
     
     fig, axes = plt.subplots(1, len(conditions), figsize=figsize)
@@ -320,11 +312,11 @@ def plot_heatmaps(data, ani_range, conditions, poststim_frames, max_tri=15,figsi
         ax.set_xticks([12.5, 20, 38])
         ax.set_xticklabels(['-1', '0', '2.4'])
         ax.tick_params(axis='x', rotation=0, labelsize=15)
-        
+
         if i == 0:
             ax.set_ylabel(f'{label} # (sorted)', fontsize=15)
             num_neurons = vals.shape[0]
-            y_ticks = np.arange(0, num_neurons, 1000)
+            y_ticks = np.arange(0, num_neurons, 100)
             ax.set_yticks(y_ticks)
             ax.set_yticklabels(y_ticks)
         else:
@@ -338,20 +330,17 @@ def plot_heatmaps(data, ani_range, conditions, poststim_frames, max_tri=15,figsi
     plt.tight_layout()
     return fig, axes
 
-def plot_quick_heatmap(data, ani, grating, trials, cells=None, sort_frames=slice(23,30),
-                     vmin=-2, vmax=2, figsize=(6,8), difference=False, diff_trials=None,
-                     smooth_sigma=None):
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
-    activity = data[ani]['activity'][grating][cells if cells is not None else slice(None)]
 
+def plot_quick_heatmap(data, ani, grating, trials, cells=None, sort_frames=slice(23,30), 
+                     vmin=-2, vmax=2, figsize=(6,8), difference=False, diff_trials=None):
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    activity = data[ani]['activity'][grating][cells or slice(None)]
+    
     if difference and diff_trials is not None:
         plot_data = np.mean(activity[:, trials, :], axis=1) - np.mean(activity[:, diff_trials, :], axis=1)
     else:
         plot_data = np.mean(activity[:, trials, :], axis=1)
-
-    if smooth_sigma is not None:
-        plot_data = gaussian_filter1d(plot_data, sigma=smooth_sigma, axis=1)
-
+    
     sort_idx = np.argsort(np.mean(plot_data[:, sort_frames], axis=1))
     sns.heatmap(plot_data[sort_idx], ax=ax, cmap='bwr', cbar=True, vmax=vmax, vmin=vmin)
     ax.set_xticks([11.5, 19, 37])

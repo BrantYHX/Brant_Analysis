@@ -125,7 +125,7 @@ def init_trial_blocks(unpred_gratings, max_tr=4):
     blo1, blo2 = {}, {}
     for ind, gr in enumerate(unpred_gratings):
         blo1[f"X{ind}"] = unpred_gratings[gr][:max_tr]
-        blo2[f"X{ind}"] = unpred_gratings[gr][16:16+max_tr]
+        blo2[f"X{ind}"] = unpred_gratings[gr][15:15+max_tr]
         # blo2[f"X{ind}"] = unpred_gratings[gr][-20:-20+max_tr]
     return blo1, blo2
 
@@ -154,23 +154,6 @@ def sparse_pred_trials(data_ani, unpred_gratings, max_tr, method='simple'):
     return btri[:max_tr].tolist()
 
 def get_sig_cells(data_ani, blo1_tris, blo2_tris, mapping, thres, pre_frames, post_frames,method ='ttest'):
-    """
-    Identify significant neurons for each grating label across two trial blocks.
-
-    Args:
-        data_ani:     Single animal's data dict containing 'activity'
-        blo1_tris:    Trial indices for block 1, keyed by label
-        blo2_tris:    Trial indices for block 2, keyed by label
-        mapping:      Dict mapping labels to grating identifiers in activity data
-        thres:        Significance threshold (p-value or z-score depending on method)
-        pre_frames:   Number of frames before stimulus onset
-        post_frames:  Number of frames after stimulus onset
-        method:       Statistical test to use: 'ttest', 'bootstrap', or 'threshold'
-
-    Returns:
-        sig_cells: Dict mapping each label to a list of significant neuron indices,
-                   plus 'all' key containing the union across all labels
-    """
     sig_cells = {}
     for label in mapping.keys():
         act_grat = mapping.get(label, label)
